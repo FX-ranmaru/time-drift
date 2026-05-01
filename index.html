@@ -1,0 +1,2299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Time Drift - 石器時代サバイバル</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    background: #0a0e1a;
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif;
+    user-select: none; -webkit-user-select: none;
+    touch-action: none;
+    color: #fff;
+  }
+  #wrap {
+    position: relative; width: 100vw; height: 100vh;
+    display: flex; justify-content: center; align-items: center;
+    background:
+      radial-gradient(ellipse at 30% 20%, rgba(80, 130, 200, 0.12) 0%, transparent 50%),
+      radial-gradient(ellipse at center, #1a2030 0%, #050810 100%);
+  }
+  canvas {
+    display: block;
+    background: #c8a878;
+    box-shadow: 0 10px 60px rgba(0, 200, 255, 0.15), 0 4px 30px rgba(0,0,0,0.6);
+    cursor: grab;
+  }
+  canvas:active { cursor: grabbing; }
+  #hud {
+    position: absolute; top: 12px; left: 12px;
+    pointer-events: none;
+    text-shadow: 0 2px 4px rgba(0,0,0,0.9);
+    font-weight: bold;
+  }
+  #money {
+    font-size: 30px; color: #ffd84a;
+    display: flex; align-items: center; gap: 6px;
+  }
+  #money::before { content: "💰"; font-size: 24px; }
+  #stats {
+    margin-top: 4px; font-size: 12px; color: #cfe;
+    line-height: 1.5;
+  }
+  #toast {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: rgba(180, 220, 255, 0.85);
+    font-size: 14px; pointer-events: none;
+    text-align: center; line-height: 1.7;
+    text-shadow: 0 0 8px rgba(0, 200, 255, 0.4);
+    transition: opacity 0.5s;
+  }
+  #clear {
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at center, rgba(0, 60, 120, 0.85) 0%, rgba(0, 0, 0, 0.95) 100%);
+    display: none;
+    flex-direction: column;
+    justify-content: center; align-items: center;
+    z-index: 10;
+    backdrop-filter: blur(4px);
+  }
+  #clear.show { display: flex; }
+  #clear h1 {
+    font-size: 48px;
+    background: linear-gradient(90deg, #66e0ff, #aaf0ff, #ffffff, #aaf0ff, #66e0ff);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: 0 0 30px rgba(120, 220, 255, 0.6);
+    margin-bottom: 12px;
+    letter-spacing: 4px;
+  }
+  #clear p {
+    font-size: 18px; color: #cfe;
+    margin-bottom: 24px; letter-spacing: 1px;
+  }
+  #clear button {
+    padding: 12px 28px; font-size: 14px; font-weight: bold;
+    background: linear-gradient(180deg, #00aaff, #0066cc);
+    color: #fff; border: 1px solid rgba(150, 220, 255, 0.8);
+    border-radius: 8px; cursor: pointer;
+    box-shadow: 0 0 20px rgba(0, 200, 255, 0.5);
+    letter-spacing: 2px;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="hud">
+    <div id="money">0</div>
+    <div id="stats">
+      在庫: <span id="carry">0</span> / <span id="cap">15</span><br>
+      仲間: <span id="huntCount">0</span>討伐 / <span id="collCount">0</span>回収
+    </div>
+  </div>
+  <div id="toast">画面をドラッグして移動<br>マンモスを倒して肉を集めよう<br>パネルに乗ると施設や仲間が解放されます</div>
+  <div id="clear">
+    <h1>GAME CLEAR</h1>
+    <p>タイムマシンが起動した — 未来へ帰還しました</p>
+    <button onclick="location.reload()">もう一度遊ぶ</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ===========================================================
+  // ISO PROJECTION
+  // ===========================================================
+  const ISO_X = 0.5;
+  const ISO_Y = 0.25;
+  const CV_W = 760;
+  const CV_H = 1100;
+  const ORIGIN_X = CV_W / 2;
+  const ORIGIN_Y = 90;
+  const camera = { x: 0, y: 0 };
+
+  function w2s(wx, wy, z) {
+    return {
+      x: ORIGIN_X + (wx - wy) * ISO_X - camera.x,
+      y: ORIGIN_Y + (wx + wy) * ISO_Y - (z || 0) - camera.y,
+    };
+  }
+  function depth(wx, wy) { return wx + wy; }
+
+  // ===========================================================
+  // CANVAS
+  // ===========================================================
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  cv.width = CV_W;
+  cv.height = CV_H;
+
+  function fitCanvas() {
+    const wrap = document.getElementById('wrap');
+    const aspect = CV_W / CV_H;
+    let w = wrap.clientWidth, h = wrap.clientHeight;
+    if (w / h > aspect) w = h * aspect; else h = w / aspect;
+    cv.style.width = w + 'px';
+    cv.style.height = h + 'px';
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
+  const TAU = Math.PI * 2;
+  const WORLD_SIZE = 1100;
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function dist2(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return dx*dx + dy*dy; }
+
+  // ===========================================================
+  // FLOORS
+  // ===========================================================
+  // Floor center coords, plus visual color and lock state.
+  // unlockCost > 0 means the floor itself must be unlocked first via a panel.
+  // Order: origin (start), N, W, S (cost 2000), E (cost 20000)
+  const FLOOR_DEFS = {
+    origin: { fx: 0,  fy: 0,  colors: ['#a6824f', '#8d6e44', '#5e4324'], label: '中央フロア', unlockCost: 0 },
+    north:  { fx: 0,  fy: -1, colors: ['#7d6a48', '#5d4f30', '#3a2f1c'], label: '北のフロア', unlockCost: 0 },
+    west:   { fx: -1, fy: 0,  colors: ['#4a5e7a', '#324154', '#1f2c3d'], label: '西のフロア', unlockCost: 0 },
+    south:  { fx: 0,  fy: 1,  colors: ['#6d8a4f', '#4f6b3a', '#2c4520'], label: '南のフロア', unlockCost: 2000 },
+    east:   { fx: 1,  fy: 0,  colors: ['#5a3c28', '#3e2918', '#231510'], label: '東のフロア', unlockCost: 20000 },
+  };
+
+  function makeFloor(key) {
+    const def = FLOOR_DEFS[key];
+    const cx = WORLD_SIZE/2 + def.fx * WORLD_SIZE;
+    const cy = WORLD_SIZE/2 + def.fy * WORLD_SIZE;
+    const f = {
+      key, def, cx, cy,
+      enemies: [], meats: [],
+      rocks: [], grass: [],
+      revealT: 0,
+      unlocked: key === 'origin',  // only origin is unlocked at start; others appear when their unlock panel is used
+    };
+    for (let i = 0; i < 24; i++) {
+      f.rocks.push({
+        x: cx + rand(-WORLD_SIZE/2 + 80, WORLD_SIZE/2 - 80),
+        y: cy + rand(-WORLD_SIZE/2 + 80, WORLD_SIZE/2 - 80),
+        r: 8 + Math.random() * 18,
+        shade: 0.7 + Math.random() * 0.3,
+      });
+    }
+    for (let i = 0; i < 60; i++) {
+      f.grass.push({
+        x: cx + rand(-WORLD_SIZE/2 + 60, WORLD_SIZE/2 - 60),
+        y: cy + rand(-WORLD_SIZE/2 + 60, WORLD_SIZE/2 - 60),
+        n: 3 + Math.floor(Math.random() * 3),
+      });
+    }
+    return f;
+  }
+
+  // ===========================================================
+  // PANELS
+  // ===========================================================
+  // Panel kinds:
+  //   weapon       — increases player damage one-shot
+  //   hunter       — spawn one combat NPC (attacks mammoths)
+  //   collector    — spawn one collector NPC (picks up meats, brings to sell)
+  //   bike         — give player a bike: +60% move speed
+  //   drone        — automatic flying meat collector
+  //   freezer      — meat sells for 2x money
+  //   timeMachine  — clear the game
+  //   floorUnlock  — opens an entire floor (south/east)
+  //   nextFloorPanel — when all prior panels in a floor are unlocked, this becomes
+  //                    visible and shows the next floor's unlock panel position
+  //
+  // Each panel has: id, kind, x, y, cost, used, payload, dependsOn (array of ids
+  // that must already be `used` for this panel to be visible/active).
+  //
+  // Layout: panels arranged in a row inside each floor's "camp strip"
+  //
+  function makePanel(opts) {
+    return {
+      id: opts.id,
+      kind: opts.kind,
+      x: opts.x, y: opts.y,
+      cost: opts.cost,
+      label: opts.label,
+      icon: opts.icon,
+      payload: opts.payload || null,
+      dependsOn: opts.dependsOn || [],
+      used: false,
+      // Animation state for the unlock pop
+      popT: 0,
+      // Reveal animation when the panel first appears
+      revealT: 1,
+    };
+  }
+
+  function panelVisible(p) {
+    if (p.dependsOn.length === 0) return true;
+    return p.dependsOn.every(d => {
+      if (typeof d === 'string' && d.startsWith('flag:')) {
+        const f = d.slice(5);
+        return !!state.flags[f];
+      }
+      return state.panels.find(o => o.id === d && o.used);
+    });
+  }
+  function panelDone(p) { return p.used; }
+  function panelActive(p) { return !p.used && panelVisible(p); }
+
+  // ===========================================================
+  // STATE
+  // ===========================================================
+  const state = {
+    money: 0,
+    cleared: false,
+    player: {
+      x: WORLD_SIZE/2, y: WORLD_SIZE/2 + 200,
+      r: 26, baseSpd: 4.0,
+      facing: 4, walkPhase: 0,
+      attackCd: 0,
+      hitFlash: 0,
+      glowPhase: 0,
+      target: null,
+      hasBike: false,
+      level: 1,        // weapon level — increased by weapon panels
+    },
+    floors: {},      // key -> floor
+    panels: [],
+    flying: [],      // pickup / sell flying objects
+    stack: [],       // meats on player's back
+    moneyOrbs: [],   // physical money piles to collect
+    pops: [],
+    particles: [],
+    beams: [],
+    drones: [],
+    hunters: [],     // NPCs - hunters/collectors
+    collectors: [],
+    shockwaves: [],
+    sellZone: { x: WORLD_SIZE/2, y: 60, w: 200, h: 70 },
+    moneyDropX: WORLD_SIZE/2 + 160,    // money piles spawn here
+    moneyDropY: 80,
+    spawnerCd: 0,
+    time: 0,
+    shake: 0,
+    hitFlash: 0,
+    freezerActive: false,
+    moneyMultiActive: false,
+    flags: {
+      midBossDefeated: false,
+      finalBossDefeated: false,
+    },
+    bossSpawnedSouth: false,
+    bossSpawnedEast: false,
+  };
+
+  // Initialize floors
+  for (const key of Object.keys(FLOOR_DEFS)) {
+    state.floors[key] = makeFloor(key);
+  }
+  state.floors.origin.revealT = 1;
+  state.floors.north.revealT = 0;
+  state.floors.west.revealT = 0;
+  state.floors.south.revealT = 0;
+  state.floors.east.revealT = 0;
+
+  // ===========================================================
+  // PANEL LAYOUT
+  // ===========================================================
+  // Helper to compute world-position grid for a floor's panels
+  function fcx(key) { return state.floors[key].cx; }
+  function fcy(key) { return state.floors[key].cy; }
+
+  // Panels are placed near the top of each floor in a grid
+  // Origin floor: 3 starter panels + a "next floor" panel
+  // We use Y offsets that are relatively close to the top of the floor.
+
+  // Origin floor — middle row of 3 panels
+  state.panels.push(makePanel({
+    id: 'O.weapon', kind: 'weapon',
+    x: fcx('origin') - 230, y: fcy('origin') - 350,
+    cost: 100, icon: '⚡', label: '武器強化',
+    payload: { dmgBoost: 4 },
+  }));
+  state.panels.push(makePanel({
+    id: 'O.hunter', kind: 'hunter',
+    x: fcx('origin'),       y: fcy('origin') - 350,
+    cost: 100, icon: '🏹', label: '討伐仲間',
+    payload: { home: 'origin' },
+  }));
+  state.panels.push(makePanel({
+    id: 'O.collector', kind: 'collector',
+    x: fcx('origin') + 230, y: fcy('origin') - 350,
+    cost: 100, icon: '🧺', label: '回収仲間',
+    payload: { home: 'origin' },
+  }));
+  // After all 3 are unlocked, this panel appears and reveals the north floor
+  state.panels.push(makePanel({
+    id: 'O.unlockN', kind: 'floorReveal',
+    x: fcx('origin'),       y: fcy('origin') - 470,
+    cost: 0, icon: '🧭', label: '北フロア解放',
+    payload: { floor: 'north' },
+    dependsOn: ['O.weapon', 'O.hunter', 'O.collector'],
+  }));
+
+  // North floor
+  state.panels.push(makePanel({
+    id: 'N.hunter', kind: 'hunter',
+    x: fcx('north') - 230, y: fcy('north') - 350,
+    cost: 300, icon: '🏹', label: '討伐仲間',
+    payload: { home: 'north' },
+    dependsOn: ['O.unlockN'],
+  }));
+  state.panels.push(makePanel({
+    id: 'N.collector', kind: 'collector',
+    x: fcx('north') + 230, y: fcy('north') - 350,
+    cost: 300, icon: '🧺', label: '回収仲間',
+    payload: { home: 'north' },
+    dependsOn: ['O.unlockN'],
+  }));
+  state.panels.push(makePanel({
+    id: 'N.bike', kind: 'bike',
+    x: fcx('north'),       y: fcy('north') - 350,
+    cost: 500, icon: '🏍', label: 'バイク',
+    dependsOn: ['O.unlockN'],
+  }));
+  state.panels.push(makePanel({
+    id: 'N.unlockW', kind: 'floorReveal',
+    x: fcx('north'),       y: fcy('north') - 470,
+    cost: 0, icon: '🧭', label: '西フロア解放',
+    payload: { floor: 'west' },
+    dependsOn: ['N.hunter', 'N.collector', 'N.bike'],
+  }));
+
+  // West floor
+  state.panels.push(makePanel({
+    id: 'W.hunter', kind: 'hunter',
+    x: fcx('west') - 230, y: fcy('west') - 350,
+    cost: 800, icon: '🏹', label: '討伐仲間',
+    payload: { home: 'west' },
+    dependsOn: ['N.unlockW'],
+  }));
+  state.panels.push(makePanel({
+    id: 'W.collector', kind: 'collector',
+    x: fcx('west') + 230, y: fcy('west') - 350,
+    cost: 800, icon: '🧺', label: '回収仲間',
+    payload: { home: 'west' },
+    dependsOn: ['N.unlockW'],
+  }));
+  state.panels.push(makePanel({
+    id: 'W.drone', kind: 'drone',
+    x: fcx('west'),       y: fcy('west') - 350,
+    cost: 1200, icon: '🛰', label: '自動回収ドローン',
+    dependsOn: ['N.unlockW'],
+  }));
+
+  // South floor — first paid floor unlock (gating panel sits in origin floor)
+  state.panels.push(makePanel({
+    id: 'O.unlockS', kind: 'floorUnlock',
+    x: fcx('origin'),       y: fcy('origin') + 460,
+    cost: 2000, icon: '🧭', label: '南フロア解放',
+    payload: { floor: 'south' },
+    dependsOn: ['N.unlockW'],
+  }));
+  state.panels.push(makePanel({
+    id: 'S.freezer', kind: 'freezer',
+    x: fcx('south') - 230, y: fcy('south') - 350,
+    cost: 0, icon: '❄', label: '冷凍倉庫',
+    dependsOn: ['O.unlockS'],
+  }));
+  // 20× money panel — only appears once the south mid-boss is defeated
+  state.panels.push(makePanel({
+    id: 'S.moneyMulti', kind: 'moneyMulti',
+    x: fcx('south') + 230, y: fcy('south') - 350,
+    cost: 0, icon: '💎', label: '獲得金額20倍',
+    dependsOn: ['flag:midBossDefeated'],
+  }));
+
+  // East floor — endgame, gated by the final boss
+  state.panels.push(makePanel({
+    id: 'O.unlockE', kind: 'floorUnlock',
+    x: fcx('origin') + 460, y: fcy('origin'),
+    cost: 20000, icon: '🧭', label: '東フロア解放',
+    payload: { floor: 'east' },
+    dependsOn: ['O.unlockS', 'S.freezer'],
+  }));
+  state.panels.push(makePanel({
+    id: 'E.timeMachine', kind: 'timeMachine',
+    x: fcx('east'),         y: fcy('east'),
+    cost: 0, icon: '⏣', label: 'タイムマシン',
+    dependsOn: ['flag:finalBossDefeated'],
+  }));
+
+  // ===========================================================
+  // INPUT
+  // ===========================================================
+  const input = { active: false, sx: 0, sy: 0, cx: 0, cy: 0 };
+  function clientToCanvas(cx, cy) {
+    const rect = cv.getBoundingClientRect();
+    return {
+      x: (cx - rect.left) * (CV_W / rect.width),
+      y: (cy - rect.top) * (CV_H / rect.height),
+    };
+  }
+  cv.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    cv.setPointerCapture(e.pointerId);
+    const p = clientToCanvas(e.clientX, e.clientY);
+    input.active = true;
+    input.sx = input.cx = p.x;
+    input.sy = input.cy = p.y;
+    document.getElementById('toast').style.opacity = '0';
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!input.active) return;
+    const p = clientToCanvas(e.clientX, e.clientY);
+    input.cx = p.x; input.cy = p.y;
+  });
+  function endDrag() { input.active = false; }
+  cv.addEventListener('pointerup', endDrag);
+  cv.addEventListener('pointercancel', endDrag);
+  cv.addEventListener('pointerleave', endDrag);
+
+  function joystickWorldVec(dxScreen, dyScreen) {
+    const a = dxScreen / ISO_X;
+    const b = dyScreen / ISO_Y;
+    return { wx: (a + b) * 0.5, wy: (b - a) * 0.5 };
+  }
+  function facingFromVec(dx, dy) {
+    if (dx === 0 && dy === 0) return null;
+    const ang = Math.atan2(dy, dx);
+    let oct = Math.round(ang / (Math.PI / 4));
+    if (oct < 0) oct += 8;
+    return oct % 8;
+  }
+  function facingToDelta(f) {
+    const map = {
+      0: [ 1, 0], 1: [ 1, 1], 2: [ 0, 1], 3: [-1, 1],
+      4: [-1, 0], 5: [-1,-1], 6: [ 0,-1], 7: [ 1,-1],
+    };
+    const [wdx, wdy] = map[f] || [0, 0];
+    return { sx: (wdx - wdy) * ISO_X, sy: (wdx + wdy) * ISO_Y };
+  }
+
+  // ===========================================================
+  // STATS / DERIVED
+  // ===========================================================
+  function unlockedFloorCount() {
+    let n = 0;
+    for (const k in state.floors) if (state.floors[k].unlocked) n++;
+    return n;
+  }
+  // Mammoth HP scales with how many floors are unlocked, not real time.
+  // Floor 1: 32 HP   (Lv1 4-shot, Lv2+ 3-shot)
+  // Floor 2: 60 HP
+  // Floor 3: 100 HP
+  // Floor 4: 160 HP
+  // Floor 5: 240 HP
+  function mammothHp() {
+    const fc = unlockedFloorCount();
+    return [32, 60, 100, 160, 240][Math.min(fc - 1, 4)] || 32;
+  }
+  function carryCap() { return 15 + Math.max(0, state.player.level - 1) * 8; }
+  // Player damage: Lv1 = mammothHp/4 (slow start), Lv2+ = ceil(mammothHp/3) (always 3-hit kills)
+  function attackPow() {
+    const hp = mammothHp();
+    if (state.player.level <= 1) return Math.ceil(hp / 4);
+    return Math.ceil(hp / 3);
+  }
+  function attackCd() { return Math.max(8, 22 - (state.player.level - 1) * 2); }
+  function attackRange() { return 130 + (state.player.level - 1) * 12; }
+  function moveSpd() {
+    let s = state.player.baseSpd;
+    if (state.player.hasBike) s *= 3.2;  // bike now 2× the previous boost (was 1.6× → now 3.2×)
+    return s;
+  }
+  function pickupRange() { return 70; }
+  function sellInterval() { return 3; }
+  function meatValue() {
+    let v = 5 + (state.player.level - 1) * 2;
+    if (state.freezerActive) v *= 2;
+    if (state.moneyMultiActive) v *= 20;
+    return Math.round(v);
+  }
+
+  function* allEnemies() {
+    for (const k in state.floors) for (const e of state.floors[k].enemies) yield e;
+  }
+  function* allMeats() {
+    for (const k in state.floors) for (const m of state.floors[k].meats) yield m;
+  }
+
+  // ===========================================================
+  // SPAWN
+  // ===========================================================
+  function spawnEnemy(floor) {
+    const side = Math.floor(Math.random() * 4);
+    const cx = floor.cx, cy = floor.cy;
+    let x, y;
+    const m = 90;
+    if (side === 0) { x = rand(cx - WORLD_SIZE/2 + m, cx + WORLD_SIZE/2 - m); y = cy + WORLD_SIZE/2 - m; }
+    else if (side === 1) { x = rand(cx - WORLD_SIZE/2 + m, cx + WORLD_SIZE/2 - m); y = cy - WORLD_SIZE/2 + m + 200; }
+    else if (side === 2) { x = cx - WORLD_SIZE/2 + m; y = rand(cy - WORLD_SIZE/2 + m + 100, cy + WORLD_SIZE/2 - m); }
+    else { x = cx + WORLD_SIZE/2 - m; y = rand(cy - WORLD_SIZE/2 + m + 100, cy + WORLD_SIZE/2 - m); }
+    const baseHp = mammothHp();
+    floor.enemies.push({
+      x, y, r: 36, hp: baseHp, maxHp: baseHp, hitFlash: 0,
+      bobPhase: Math.random() * TAU, vx: 0, vy: 0, anim: 0, facing: 4,
+      floor,
+    });
+  }
+
+  // Boss enemy — one per floor, larger and tougher than regular mammoths.
+  // mid (south): 10× regular HP; final (east): 30× regular HP
+  function spawnBoss(floor, type) {
+    const baseHp = mammothHp() * (type === 'final' ? 30 : 10);
+    floor.enemies.push({
+      x: floor.cx, y: floor.cy + 50,
+      r: type === 'final' ? 64 : 52,
+      hp: baseHp, maxHp: baseHp, hitFlash: 0,
+      bobPhase: Math.random() * TAU,
+      vx: 0, vy: 0, anim: 0, facing: 4,
+      floor,
+      isBoss: true,
+      bossType: type,   // 'mid' | 'final'
+    });
+    // Dramatic entrance — shake screen + ring + particles
+    state.shake = Math.max(state.shake, 18);
+    state.shockwaves.push({
+      x: floor.cx, y: floor.cy + 50, r: 30, max: 350, life: 50, lifeMax: 50,
+    });
+    for (let i = 0; i < 100; i++) {
+      const a = Math.random() * TAU, sp = rand(2, 8);
+      state.particles.push({
+        x: floor.cx, y: floor.cy + 50, z: 30,
+        vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(2, 8),
+        life: 70, max: 70,
+        color: type === 'final' ? '#c878ff' : '#ff8a40', r: rand(2, 5),
+      });
+    }
+    state.pops.push({
+      worldX: floor.cx, worldY: floor.cy + 50, z: 120, vy: -1.6,
+      life: 110, max: 110,
+      txt: type === 'final' ? '⚠ 最終ボス出現!' : '⚠ 中ボス出現!',
+      color: type === 'final' ? '#c878ff' : '#ff8a40',
+      stroke: type === 'final' ? '#2a0a3a' : '#3a1a00',
+      size: 32, glow: true,
+    });
+  }
+
+  function spawnMeat(x, y, floor) {
+    for (let i = 0; i < 8; i++) {
+      const a = Math.random() * TAU, s = rand(1, 3);
+      state.particles.push({
+        x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s, vz: rand(2, 5), z: 30,
+        life: 30, max: 30, color: '#c44a3a', r: 3,
+      });
+    }
+    floor.meats.push({
+      x: x + rand(-15, 15), y: y + rand(-15, 15),
+      vx: rand(-2.5, 2.5), vy: rand(-4, -1.5),
+      gz: 0, vz: rand(3, 5),
+      r: 11, settled: false, life: 0,
+      floor,
+    });
+  }
+
+  function dropMoneyOrb(amount) {
+    const x = state.moneyDropX + rand(-30, 30);
+    const y = state.moneyDropY + rand(-15, 15);
+    state.moneyOrbs.push({
+      x, y, z: 0, vz: rand(4, 6),
+      ground: false, life: 0,
+      amount,
+      bob: Math.random() * TAU,
+    });
+  }
+
+  // ===========================================================
+  // PANEL ACTIVATION
+  // ===========================================================
+  function activatePanel(p) {
+    if (p.used) return;
+    if (state.cleared) return;
+
+    // Pop animation regardless of payload
+    p.popT = 1;
+    state.shockwaves.push({
+      x: p.x, y: p.y, r: 20, max: 140, life: 26, lifeMax: 26,
+    });
+    state.shake = Math.max(state.shake, 9);
+    for (let i = 0; i < 50; i++) {
+      const a = Math.random() * TAU, sp = rand(2, 7);
+      state.particles.push({
+        x: p.x, y: p.y, z: 30,
+        vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(2, 7),
+        life: 60, max: 60,
+        color: Math.random() < 0.5 ? '#aaf0ff' : '#ffd84a', r: rand(2, 4.5),
+      });
+    }
+
+    switch (p.kind) {
+      case 'weapon': {
+        state.player.level += 1;
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 60, max: 60, txt: '武器Lv UP!', color: '#aaf0ff', stroke: '#0a3a6a', size: 26, glow: true });
+        break;
+      }
+      case 'hunter': {
+        spawnHunter(p.payload.home);
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 60, max: 60, txt: '討伐仲間 加入!', color: '#ffaa55', stroke: '#3a2a00', size: 22, glow: true });
+        break;
+      }
+      case 'collector': {
+        spawnCollector(p.payload.home);
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 60, max: 60, txt: '回収仲間 加入!', color: '#7affb0', stroke: '#0a3a1a', size: 22, glow: true });
+        break;
+      }
+      case 'bike': {
+        state.player.hasBike = true;
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 70, max: 70, txt: '🏍 バイク獲得!', color: '#ff7a55', stroke: '#3a1a00', size: 28, glow: true });
+        break;
+      }
+      case 'drone': {
+        addDrone();
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 70, max: 70, txt: 'ドローン稼働!', color: '#aaf0ff', stroke: '#0a3a6a', size: 24, glow: true });
+        break;
+      }
+      case 'freezer': {
+        state.freezerActive = true;
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 70, max: 70, txt: '❄ 売価2倍!', color: '#aaf0ff', stroke: '#0a3a6a', size: 28, glow: true });
+        break;
+      }
+      case 'moneyMulti': {
+        state.moneyMultiActive = true;
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 90, max: 90, txt: '💎 獲得金額20倍!', color: '#ffd84a', stroke: '#3a2a00', size: 30, glow: true });
+        break;
+      }
+      case 'floorReveal':
+      case 'floorUnlock': {
+        const fkey = p.payload.floor;
+        const f = state.floors[fkey];
+        if (f) {
+          f.unlocked = true;
+          f.revealT = 0;
+          // Spawn the boss for south/east floors when first unlocked
+          if (fkey === 'south' && !state.bossSpawnedSouth) {
+            spawnBoss(f, 'mid');
+            state.bossSpawnedSouth = true;
+          } else if (fkey === 'east' && !state.bossSpawnedEast) {
+            spawnBoss(f, 'final');
+            state.bossSpawnedEast = true;
+          }
+        }
+        state.pops.push({ worldX: p.x, worldY: p.y, z: 90, vy: -1.5, life: 80, max: 80, txt: 'フロア解放!', color: '#ffd84a', stroke: '#3a2a00', size: 30, glow: true });
+        break;
+      }
+      case 'timeMachine': {
+        triggerClear();
+        return;
+      }
+    }
+    p.used = true;
+  }
+
+  function triggerClear() {
+    state.cleared = true;
+    const p = state.player;
+    for (let i = 0; i < 200; i++) {
+      const a = Math.random() * TAU, sp = rand(2, 9);
+      state.particles.push({
+        x: p.x, y: p.y, z: 40,
+        vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(2, 10),
+        life: 100, max: 100,
+        color: Math.random() < 0.5 ? '#aaf0ff' : '#ffffff', r: rand(2, 5),
+      });
+    }
+    setTimeout(() => {
+      document.getElementById('clear').classList.add('show');
+    }, 1200);
+  }
+
+  // ===========================================================
+  // NPCs
+  // ===========================================================
+  function spawnHunter(homeKey) {
+    const f = state.floors[homeKey];
+    state.hunters.push({
+      x: f.cx + rand(-50, 50),
+      y: f.cy + rand(60, 120),
+      r: 16,
+      attackCd: rand(0, 20),
+      target: null,
+      facing: 4, walkPhase: 0,
+      tint: Math.floor(Math.random() * 4),
+      bob: Math.random() * TAU,
+      home: homeKey,
+    });
+  }
+  function spawnCollector(homeKey) {
+    const f = state.floors[homeKey];
+    state.collectors.push({
+      x: f.cx + rand(-50, 50),
+      y: f.cy + rand(60, 120),
+      r: 16,
+      facing: 4, walkPhase: 0,
+      tint: Math.floor(Math.random() * 4),
+      bob: Math.random() * TAU,
+      home: homeKey,
+      mode: 'idle',     // 'idle' | 'seekMeat' | 'returning'
+      target: null,
+      hold: null,
+    });
+  }
+  function addDrone() {
+    state.drones.push({
+      x: state.sellZone.x, y: state.sellZone.y + 30, z: 60,
+      mode: 'idle', target: null, hold: null,
+      cooldown: 30, bob: Math.random() * TAU,
+    });
+  }
+
+  function hunterAttackPow() { return Math.ceil(mammothHp() / 5); }
+  function hunterAttackCd() { return Math.max(14, 30 - state.player.level * 2); }
+  function hunterRange() { return 100; }
+
+  function updateHunters(dt) {
+    for (const h of state.hunters) {
+      h.bob += 0.08;
+      h.attackCd -= dt;
+      // Find nearest enemy on home floor
+      const f = state.floors[h.home];
+      let best = null, bestD = Infinity;
+      for (const e of f.enemies) {
+        const dx = e.x - h.x, dy = e.y - h.y;
+        const d = dx*dx + dy*dy;
+        if (d < bestD) { bestD = d; best = e; }
+      }
+      h.target = best;
+      if (best) {
+        const dx = best.x - h.x, dy = best.y - h.y;
+        const dd = Math.hypot(dx, dy);
+        if (dd > hunterRange() - 6) {
+          const sp = 3.0;
+          h.x += (dx / dd) * sp;
+          h.y += (dy / dd) * sp;
+          h.walkPhase += 0.35;
+          const fc = facingFromVec(dx, dy); if (fc !== null) h.facing = fc;
+        } else {
+          if (h.attackCd <= 0) {
+            best.hp -= hunterAttackPow();
+            best.hitFlash = 8;
+            h.attackCd = hunterAttackCd();
+            state.beams.push({
+              sx: h.x, sy: h.y, sz: 28,
+              ex: best.x, ey: best.y, ez: 28,
+              life: 6, max: 6, power: 1,
+            });
+            const fc = facingFromVec(dx, dy); if (fc !== null) h.facing = fc;
+          }
+        }
+      } else {
+        // wander
+        if (Math.random() < 0.02) { h.vx = rand(-1, 1); h.vy = rand(-1, 1); }
+        h.x += h.vx || 0; h.y += h.vy || 0;
+        h.vx *= 0.92; h.vy *= 0.92;
+      }
+      // Clamp to floor
+      h.x = Math.max(f.cx - WORLD_SIZE/2 + 30, Math.min(f.cx + WORLD_SIZE/2 - 30, h.x));
+      h.y = Math.max(f.cy - WORLD_SIZE/2 + 30, Math.min(f.cy + WORLD_SIZE/2 - 30, h.y));
+    }
+  }
+
+  function updateCollectors(dt) {
+    for (const c of state.collectors) {
+      c.bob += 0.08;
+      const f = state.floors[c.home];
+      const sellX = state.sellZone.x;
+      const sellY = state.sellZone.y + 30;
+
+      if (c.mode === 'idle') {
+        // Wander gently in home floor; trigger seek if any meat exists in this floor
+        if (Math.random() < 0.02) { c.vx = rand(-0.6, 0.6); c.vy = rand(-0.6, 0.6); }
+        c.x += (c.vx || 0); c.y += (c.vy || 0);
+        c.vx *= 0.92; c.vy *= 0.92;
+        if (f.meats.length > 0) {
+          // Pick the closest meat
+          let best = null, bestD = Infinity;
+          for (const m of f.meats) {
+            const dx = m.x - c.x, dy = m.y - c.y;
+            const d = dx*dx + dy*dy;
+            if (d < bestD) { bestD = d; best = m; }
+          }
+          if (best) { c.target = best; c.mode = 'seekMeat'; }
+        }
+      } else if (c.mode === 'seekMeat') {
+        const m = c.target;
+        if (!m || f.meats.indexOf(m) === -1) {
+          c.target = null; c.mode = 'idle'; continue;
+        }
+        const dx = m.x - c.x, dy = m.y - c.y;
+        const dd = Math.hypot(dx, dy);
+        if (dd < 30) {
+          // Pick up the meat
+          const idx = f.meats.indexOf(m);
+          if (idx !== -1) f.meats.splice(idx, 1);
+          c.hold = { meatRef: true };
+          c.target = null;
+          c.mode = 'returning';
+        } else {
+          const sp = 3.0;
+          c.x += (dx / dd) * sp; c.y += (dy / dd) * sp;
+          c.walkPhase += 0.35;
+          const fc = facingFromVec(dx, dy); if (fc !== null) c.facing = fc;
+        }
+      } else if (c.mode === 'returning') {
+        // Walk to sell zone (which is in origin floor)
+        const dx = sellX - c.x, dy = sellY - c.y;
+        const dd = Math.hypot(dx, dy);
+        if (dd < 30) {
+          // Sell directly
+          const v = meatValue();
+          state.money += v;
+          dropMoneyOrb(v);
+          c.hold = null;
+          c.mode = 'idle';
+        } else {
+          const sp = 3.2;
+          c.x += (dx / dd) * sp; c.y += (dy / dd) * sp;
+          c.walkPhase += 0.35;
+          const fc = facingFromVec(dx, dy); if (fc !== null) c.facing = fc;
+        }
+      }
+      // Clamp to the union of unlocked floors so collectors can cross to sell
+      // Allow them to be in any unlocked floor (not just home).
+    }
+  }
+
+  function updateDrones(dt) {
+    for (const d of state.drones) {
+      d.bob += 0.1;
+      d.cooldown -= dt;
+      if (d.mode === 'idle') {
+        const homeX = state.sellZone.x, homeY = state.sellZone.y + 30;
+        d.x += (homeX - d.x) * 0.06;
+        d.y += (homeY - d.y) * 0.06;
+        d.z += (60 + Math.sin(d.bob) * 4 - d.z) * 0.1;
+        if (d.cooldown <= 0) {
+          let best = null, bestD = Infinity;
+          for (const k in state.floors) {
+            for (const m of state.floors[k].meats) {
+              const dx = m.x - d.x, dy = m.y - d.y;
+              const dd = dx*dx + dy*dy;
+              if (dd < bestD) { bestD = dd; best = m; }
+            }
+          }
+          if (best) { d.target = best; d.mode = 'seeking'; }
+          else d.cooldown = 12;
+        }
+      } else if (d.mode === 'seeking') {
+        const m = d.target;
+        if (!m || !m.floor || m.floor.meats.indexOf(m) === -1) { d.mode = 'idle'; d.target = null; d.cooldown = 6; continue; }
+        const dx = m.x - d.x, dy = m.y - d.y;
+        const dd = Math.hypot(dx, dy);
+        if (dd < 30) {
+          const idx = m.floor.meats.indexOf(m);
+          if (idx !== -1) m.floor.meats.splice(idx, 1);
+          d.hold = m;
+          d.mode = 'returning';
+        } else {
+          const sp = 6;
+          d.x += (dx / dd) * sp; d.y += (dy / dd) * sp;
+          d.z += (50 + Math.sin(d.bob) * 4 - d.z) * 0.1;
+        }
+      } else if (d.mode === 'returning') {
+        const dx = state.sellZone.x - d.x, dy = state.sellZone.y - d.y;
+        const dd = Math.hypot(dx, dy);
+        if (dd < 30) {
+          const v = meatValue();
+          state.money += v;
+          dropMoneyOrb(v);
+          d.hold = null; d.mode = 'idle'; d.target = null; d.cooldown = 6;
+        } else {
+          const sp = 7;
+          d.x += (dx / dd) * sp; d.y += (dy / dd) * sp;
+          d.z += (60 + Math.sin(d.bob) * 4 - d.z) * 0.1;
+        }
+      }
+    }
+  }
+
+  // ===========================================================
+  // UPDATE
+  // ===========================================================
+  function update(dt) {
+    if (state.cleared) {
+      // Keep particles ticking
+      for (let i = state.particles.length - 1; i >= 0; i--) {
+        const pa = state.particles[i];
+        pa.x += pa.vx; pa.y += pa.vy;
+        if (pa.vz !== undefined) { pa.z += pa.vz; pa.vz -= 0.3; if (pa.z < 0) pa.z = 0; }
+        pa.life -= dt;
+        if (pa.life <= 0) state.particles.splice(i, 1);
+      }
+      return;
+    }
+
+    state.time += dt;
+    const p = state.player;
+    p.glowPhase += 0.08;
+
+    // Player movement
+    if (input.active) {
+      const dxS = input.cx - input.sx, dyS = input.cy - input.sy;
+      const screenMag = Math.hypot(dxS, dyS);
+      if (screenMag > 8) {
+        const max = 80;
+        const m = Math.min(screenMag, max) / max;
+        const wv = joystickWorldVec(dxS, dyS);
+        const wMag = Math.hypot(wv.wx, wv.wy) || 1;
+        const sp = moveSpd() * m;
+        p.x += (wv.wx / wMag) * sp;
+        p.y += (wv.wy / wMag) * sp;
+        const fc = facingFromVec(wv.wx, wv.wy); if (fc !== null) p.facing = fc;
+        p.walkPhase += 0.4;
+      }
+    }
+
+    // Clamp player to union of unlocked floors (no margin so adjacent floors connect)
+    {
+      const inAny = Object.values(state.floors).some(f =>
+        f.unlocked &&
+        p.x >= f.cx - WORLD_SIZE/2 && p.x <= f.cx + WORLD_SIZE/2 &&
+        p.y >= f.cy - WORLD_SIZE/2 && p.y <= f.cy + WORLD_SIZE/2);
+      if (!inAny) {
+        let best = null, bestD = Infinity;
+        for (const k in state.floors) {
+          const f = state.floors[k];
+          if (!f.unlocked) continue;
+          const cx = Math.max(f.cx - WORLD_SIZE/2, Math.min(f.cx + WORLD_SIZE/2, p.x));
+          const cy = Math.max(f.cy - WORLD_SIZE/2, Math.min(f.cy + WORLD_SIZE/2, p.y));
+          const d = (cx - p.x) ** 2 + (cy - p.y) ** 2;
+          if (d < bestD) { bestD = d; best = f; }
+        }
+        if (best) {
+          p.x = Math.max(best.cx - WORLD_SIZE/2, Math.min(best.cx + WORLD_SIZE/2, p.x));
+          p.y = Math.max(best.cy - WORLD_SIZE/2, Math.min(best.cy + WORLD_SIZE/2, p.y));
+        }
+      }
+    }
+    if (p.hitFlash > 0) p.hitFlash -= dt;
+
+    // Floor reveal animation
+    for (const k in state.floors) {
+      const f = state.floors[k];
+      if (f.unlocked && f.revealT < 1) f.revealT = Math.min(1, f.revealT + dt * 0.018);
+    }
+
+    // Mammoths
+    for (const e of allEnemies()) {
+      e.bobPhase += 0.06; e.anim += 0.08;
+      const dx = p.x - e.x, dy = p.y - e.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 350 && d > 1) { e.vx += (dx / d) * 0.04; e.vy += (dy / d) * 0.04; }
+      e.vx *= 0.9; e.vy *= 0.9;
+      e.x += e.vx; e.y += e.vy;
+      const f = e.floor;
+      e.x = Math.max(f.cx - WORLD_SIZE/2 + 40, Math.min(f.cx + WORLD_SIZE/2 - 40, e.x));
+      e.y = Math.max(f.cy - WORLD_SIZE/2 + 240, Math.min(f.cy + WORLD_SIZE/2 - 40, e.y));
+      if (Math.abs(e.vx) + Math.abs(e.vy) > 0.2) {
+        const fc = facingFromVec(e.vx, e.vy); if (fc !== null) e.facing = fc;
+      }
+      if (e.hitFlash > 0) e.hitFlash -= dt;
+    }
+
+    // Player auto-attack
+    p.attackCd -= dt;
+    const range = attackRange();
+    let nearest = null, best = range * range;
+    for (const e of allEnemies()) {
+      const d = dist2(p, e);
+      if (d < best) { best = d; nearest = e; }
+    }
+    p.target = nearest;
+    if (nearest && p.attackCd <= 0) {
+      nearest.hp -= attackPow();
+      nearest.hitFlash = 10;
+      p.attackCd = attackCd();
+      state.shake = Math.max(state.shake, 1.5);
+      state.beams.push({
+        sx: p.x, sy: p.y, sz: 36,
+        ex: nearest.x, ey: nearest.y, ez: 28,
+        life: 8, max: 8, power: state.player.level,
+      });
+      const dx = nearest.x - p.x, dy = nearest.y - p.y;
+      const d = Math.hypot(dx, dy) || 1;
+      nearest.vx += (dx / d) * 1.4;
+      nearest.vy += (dy / d) * 1.4;
+      const fc = facingFromVec(dx, dy); if (fc !== null) p.facing = fc;
+    }
+
+    // Beams tick
+    for (let i = state.beams.length - 1; i >= 0; i--) {
+      state.beams[i].life -= dt;
+      if (state.beams[i].life <= 0) state.beams.splice(i, 1);
+    }
+
+    // Mammoth deaths — drop meat into the right floor
+    for (const k in state.floors) {
+      const f = state.floors[k];
+      for (let i = f.enemies.length - 1; i >= 0; i--) {
+        const e = f.enemies[i];
+        if (e.hp <= 0) {
+          if (e.isBoss) {
+            // Boss death — much bigger explosion + flags + lots of meat
+            for (let j = 0; j < 120; j++) {
+              const a = Math.random() * TAU, sp = rand(3, 10);
+              state.particles.push({
+                x: e.x, y: e.y, z: 30,
+                vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(3, 9),
+                life: 90, max: 90,
+                color: Math.random() < 0.4
+                  ? (e.bossType === 'final' ? '#c878ff' : '#ff8a40')
+                  : (Math.random() < 0.5 ? '#ffffff' : '#ffd84a'),
+                r: rand(2, 6),
+              });
+            }
+            state.shockwaves.push({ x: e.x, y: e.y, r: e.r, max: 400, life: 60, lifeMax: 60 });
+            state.shockwaves.push({ x: e.x, y: e.y, r: e.r, max: 240, life: 40, lifeMax: 40 });
+            state.shake = Math.max(state.shake, 22);
+            state.pops.push({
+              worldX: e.x, worldY: e.y, z: 110, vy: -1.6,
+              life: 110, max: 110,
+              txt: e.bossType === 'final' ? '👑 最終ボス撃破!' : '⚔ 中ボス撃破!',
+              color: e.bossType === 'final' ? '#c878ff' : '#ff8a40',
+              stroke: e.bossType === 'final' ? '#2a0a3a' : '#3a1a00',
+              size: 36, glow: true,
+            });
+            // Drop a big pile of meat
+            const drops = e.bossType === 'final' ? 25 : 15;
+            for (let j = 0; j < drops; j++) spawnMeat(e.x + rand(-30, 30), e.y + rand(-30, 30), f);
+            // Set flag
+            if (e.bossType === 'mid') state.flags.midBossDefeated = true;
+            else if (e.bossType === 'final') state.flags.finalBossDefeated = true;
+          } else {
+            for (let j = 0; j < 30; j++) {
+              const a = Math.random() * TAU, sp = rand(2, 7);
+              state.particles.push({
+                x: e.x, y: e.y, z: 20,
+                vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(2, 6),
+                life: 50, max: 50,
+                color: Math.random() < 0.5 ? '#88e0ff' : (Math.random() < 0.5 ? '#ffffff' : '#d8c8a8'),
+                r: rand(2, 4),
+              });
+            }
+            state.shockwaves.push({ x: e.x, y: e.y, r: e.r, max: 100, life: 22, lifeMax: 22 });
+            state.shake = Math.max(state.shake, 7);
+            state.pops.push({ worldX: e.x, worldY: e.y, z: 60, vy: -1.6, life: 50, max: 50, txt: '撃破!', color: '#aaf0ff', stroke: '#0a3a6a', size: 26, glow: true });
+            const n = 2 + Math.floor(Math.random() * 3);
+            for (let j = 0; j < n; j++) spawnMeat(e.x, e.y, f);
+          }
+          f.enemies.splice(i, 1);
+        }
+      }
+    }
+
+    // Spawner — proportional to total NPC count + bike + drones
+    state.spawnerCd -= dt;
+    const power = state.player.level + state.hunters.length + state.collectors.length * 0.5 + state.drones.length;
+    const targetPerFloor = Math.min(20, 4 + Math.floor(power));
+    const spawnDelay = Math.max(20, 60 - power * 2);
+    if (state.spawnerCd <= 0) {
+      // Pick a random unlocked floor that has room. South and east only contain bosses.
+      const candidates = Object.values(state.floors).filter(f =>
+        f.unlocked && f.enemies.length < targetPerFloor && f.key !== 'east' && f.key !== 'south');
+      if (candidates.length > 0) {
+        spawnEnemy(candidates[Math.floor(Math.random() * candidates.length)]);
+      }
+      state.spawnerCd = spawnDelay;
+    }
+
+    // Ground meats — physics + auto-pickup, with lifetime
+    for (const k in state.floors) {
+      const f = state.floors[k];
+      const overflow = Math.max(0, f.meats.length - 60);
+      for (let i = f.meats.length - 1; i >= 0; i--) {
+        const m = f.meats[i];
+        m.life += dt;
+        if (!m.settled) {
+          m.x += m.vx; m.y += m.vy;
+          m.vx *= 0.9; m.vy *= 0.9;
+          m.gz += m.vz; m.vz -= 0.5;
+          if (m.gz <= 0 && m.life > 6) { m.gz = 0; m.vz = 0; m.settled = true; }
+        }
+        const lifeLimit = overflow > 0 ? 600 : 1500;
+        if (m.life > lifeLimit) { f.meats.splice(i, 1); continue; }
+        if (state.stack.length + state.flying.filter(fl => fl.kind === 'pickup').length < carryCap()) {
+          const pickR = p.r + m.r + pickupRange();
+          if (dist2(p, m) < pickR * pickR) {
+            state.flying.push({
+              kind: 'pickup',
+              sx: m.x, sy: m.y, sz: 0,
+              t: 0, dur: 18,
+            });
+            f.meats.splice(i, 1);
+          }
+        }
+      }
+    }
+
+    // Flying items (pickup → stack, sell → +money + orb)
+    for (let i = state.flying.length - 1; i >= 0; i--) {
+      const f = state.flying[i];
+      f.t += dt;
+      const u = Math.min(1, f.t / f.dur);
+      if (f.kind === 'pickup' && u >= 1) {
+        state.stack.push({ jiggle: 1.4, jp: 0 });
+        state.flying.splice(i, 1);
+      } else if (f.kind === 'sell' && u >= 1) {
+        const v = meatValue();
+        state.money += v;
+        dropMoneyOrb(v);
+        state.flying.splice(i, 1);
+      }
+    }
+
+    // Sell zone
+    const inSell =
+      Math.abs(p.x - state.sellZone.x) < state.sellZone.w/2 &&
+      Math.abs(p.y - state.sellZone.y) < state.sellZone.h/2 + 30;
+    if (inSell && state.stack.length > 0) {
+      if (!state._sellCd || state._sellCd <= 0) {
+        state.stack.pop();
+        state.flying.push({
+          kind: 'sell',
+          sx: p.x, sy: p.y, sz: 60 + state.stack.length * 7,
+          tx: state.sellZone.x + rand(-30, 30),
+          ty: state.sellZone.y,
+          t: 0, dur: 14,
+        });
+        state._sellCd = sellInterval();
+      } else state._sellCd -= dt;
+    } else { state._sellCd = 0; }
+
+    // Money orbs — fall to ground, then collected by player on touch
+    for (let i = state.moneyOrbs.length - 1; i >= 0; i--) {
+      const mo = state.moneyOrbs[i];
+      mo.life += dt;
+      mo.bob += 0.08;
+      if (!mo.ground) {
+        mo.z += mo.vz; mo.vz -= 0.5;
+        if (mo.z <= 0) { mo.z = 0; mo.vz = 0; mo.ground = true; }
+      }
+      // Pull toward player when close (magnet feel)
+      const dx = p.x - mo.x, dy = p.y - mo.y;
+      const dd = Math.hypot(dx, dy);
+      if (dd < 80) {
+        const sp = 4 + (80 - dd) * 0.15;
+        mo.x += (dx / dd) * sp;
+        mo.y += (dy / dd) * sp;
+      }
+      if (dd < 26) {
+        // Player already has the money in `state.money` (it was added when sold).
+        // The orb is purely physical visual; touching it just plays a small +N pop.
+        state.pops.push({ worldX: mo.x, worldY: mo.y, z: 60, vy: -1.4, life: 35, max: 35, txt: '+' + mo.amount, color: '#ffd84a', stroke: '#3a2a00', size: 16 });
+        for (let k = 0; k < 6; k++) {
+          const a = Math.random() * TAU, sp = rand(1, 3);
+          state.particles.push({
+            x: mo.x, y: mo.y, z: 20,
+            vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(0, 2),
+            life: 22, max: 22, color: '#ffd84a', r: 2.5,
+          });
+        }
+        state.moneyOrbs.splice(i, 1);
+      }
+    }
+
+    // Panel proximity activation — auto-buy when player steps on a panel
+    for (const pn of state.panels) {
+      if (!panelActive(pn)) continue;
+      const inside = Math.abs(p.x - pn.x) < 60 && Math.abs(p.y - pn.y) < 60;
+      if (inside && state.money >= pn.cost) {
+        state.money -= pn.cost;
+        activatePanel(pn);
+      }
+    }
+
+    // Panel pop animation decay
+    for (const pn of state.panels) {
+      if (pn.popT > 0) pn.popT = Math.max(0, pn.popT - dt * 0.04);
+    }
+
+    // NPCs
+    updateHunters(dt);
+    updateCollectors(dt);
+    updateDrones(dt);
+
+    // Stack jiggle
+    for (const s of state.stack) { s.jp += 0.25; s.jiggle *= 0.94; }
+
+    // Pops
+    for (let i = state.pops.length - 1; i >= 0; i--) {
+      const pop = state.pops[i];
+      pop.z = (pop.z || 0) + ((-pop.vy) || 0) * 1.5;
+      pop.vy *= 0.97;
+      pop.life -= dt;
+      if (pop.life <= 0) state.pops.splice(i, 1);
+    }
+    // Particles
+    for (let i = state.particles.length - 1; i >= 0; i--) {
+      const pa = state.particles[i];
+      pa.x += pa.vx; pa.y += pa.vy;
+      pa.vx *= 0.96; pa.vy *= 0.96;
+      if (pa.vz !== undefined) {
+        pa.z += pa.vz; pa.vz -= 0.4;
+        if (pa.z < 0) { pa.z = 0; pa.vz = 0; }
+      }
+      pa.life -= dt;
+      if (pa.life <= 0) state.particles.splice(i, 1);
+    }
+    // Shockwaves
+    for (let i = state.shockwaves.length - 1; i >= 0; i--) {
+      const sw = state.shockwaves[i];
+      sw.life -= dt;
+      sw.r += (sw.max - sw.r) * 0.18;
+      if (sw.life <= 0) state.shockwaves.splice(i, 1);
+    }
+    // Shake decay
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 0.6);
+    if (state.hitFlash > 0) state.hitFlash = Math.max(0, state.hitFlash - dt * 0.06);
+
+    // Camera follow
+    {
+      const targetX = (p.x - p.y) * ISO_X;
+      const targetY = (p.x + p.y) * ISO_Y;
+      const initialX = (550 - 750) * ISO_X;
+      const initialY = (550 + 750) * ISO_Y;
+      camera.x += (targetX - initialX - camera.x) * 0.08;
+      camera.y += (targetY - initialY - camera.y) * 0.08;
+    }
+
+    // HUD
+    document.getElementById('money').textContent = state.money;
+    document.getElementById('carry').textContent = state.stack.length + state.flying.filter(f=>f.kind==='pickup').length;
+    document.getElementById('cap').textContent = carryCap();
+    document.getElementById('huntCount').textContent = state.hunters.length;
+    document.getElementById('collCount').textContent = state.collectors.length;
+  }
+
+  // ===========================================================
+  // DRAW HELPERS
+  // ===========================================================
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function drawIsoShadow(wx, wy, w, h, alpha) {
+    const s = w2s(wx, wy);
+    ctx.fillStyle = `rgba(0, 0, 0, ${alpha || 0.3})`;
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y, w, h, 0, 0, TAU);
+    ctx.fill();
+  }
+
+  function drawFloor(f) {
+    if (!f.unlocked) return;
+    if (f.revealT <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, f.revealT);
+    const half = WORLD_SIZE / 2;
+    const a = w2s(f.cx - half, f.cy - half);
+    const b = w2s(f.cx + half, f.cy - half);
+    const c = w2s(f.cx + half, f.cy + half);
+    const d = w2s(f.cx - half, f.cy + half);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y);
+    ctx.closePath();
+    const grd = ctx.createLinearGradient(0, a.y, 0, c.y);
+    grd.addColorStop(0, f.def.colors[0]);
+    grd.addColorStop(0.4, f.def.colors[1]);
+    grd.addColorStop(1, f.def.colors[2]);
+    ctx.fillStyle = grd;
+    ctx.fill();
+    ctx.save();
+    ctx.clip();
+
+    // Camp tint at top
+    {
+      const ca = w2s(f.cx - half, f.cy - half);
+      const cb = w2s(f.cx + half, f.cy - half);
+      const cc = w2s(f.cx + half, f.cy - half + 240);
+      const cd = w2s(f.cx - half, f.cy - half + 240);
+      ctx.beginPath();
+      ctx.moveTo(ca.x, ca.y); ctx.lineTo(cb.x, cb.y); ctx.lineTo(cc.x, cc.y); ctx.lineTo(cd.x, cd.y);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(40, 30, 20, 0.3)';
+      ctx.fill();
+    }
+    // Grid lines
+    ctx.strokeStyle = 'rgba(60, 40, 20, 0.2)';
+    ctx.lineWidth = 1;
+    for (let i = -half; i <= half; i += 100) {
+      let p1 = w2s(f.cx + i, f.cy - half), p2 = w2s(f.cx + i, f.cy + half);
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+      p1 = w2s(f.cx - half, f.cy + i); p2 = w2s(f.cx + half, f.cy + i);
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
+    // Grass
+    ctx.strokeStyle = 'rgba(90, 130, 60, 0.7)'; ctx.lineWidth = 1.5;
+    for (const g of f.grass) {
+      const s = w2s(g.x, g.y);
+      for (let i = 0; i < g.n; i++) {
+        ctx.beginPath();
+        ctx.moveTo(s.x + i * 2 - 2, s.y);
+        ctx.lineTo(s.x + i * 2 - 2 + (i - 1), s.y - 5);
+        ctx.stroke();
+      }
+    }
+    // Rocks
+    for (const r of f.rocks) {
+      const s = w2s(r.x, r.y);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+      ctx.beginPath(); ctx.ellipse(s.x, s.y + r.r * 0.25, r.r, r.r * 0.35, 0, 0, TAU); ctx.fill();
+      const grd2 = ctx.createRadialGradient(s.x - r.r*0.3, s.y - r.r*0.3, 2, s.x, s.y, r.r);
+      grd2.addColorStop(0, `rgba(190, 180, 165, ${r.shade})`);
+      grd2.addColorStop(1, `rgba(85, 75, 65, ${r.shade})`);
+      ctx.fillStyle = grd2;
+      ctx.beginPath(); ctx.ellipse(s.x, s.y - r.r * 0.2, r.r, r.r * 0.85, 0, 0, TAU); ctx.fill();
+      ctx.strokeStyle = 'rgba(40, 30, 20, 0.45)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    ctx.restore(); // clip
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y);
+    ctx.closePath();
+    ctx.stroke();
+    // Floor label (corner sticker)
+    if (f.key !== 'origin') {
+      const labelP = w2s(f.cx, f.cy - half + 30);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+      roundRect(ctx, labelP.x - 60, labelP.y - 12, 120, 22, 8);
+      ctx.fill();
+      ctx.fillStyle = '#aaf0ff';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(f.def.label, labelP.x, labelP.y - 1);
+    }
+    ctx.restore();
+  }
+
+  function drawPanel(pn) {
+    if (!panelVisible(pn)) return;
+    if (pn.used) return;
+    const t = state.time * 0.05;
+    const pulse = 0.7 + Math.sin(t + pn.x * 0.01) * 0.2;
+    const canBuy = state.money >= pn.cost;
+    drawIsoShadow(pn.x, pn.y + 24, 70, 22, 0.35);
+    // Pad — diamond shape on the ground
+    const pad = (cx, cy, w, h, fill, stroke) => {
+      const a = w2s(cx - w/2, cy - h/2);
+      const b = w2s(cx + w/2, cy - h/2);
+      const c = w2s(cx + w/2, cy + h/2);
+      const d = w2s(cx - w/2, cy + h/2);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y);
+      ctx.closePath();
+      ctx.fillStyle = fill; ctx.fill();
+      ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke();
+    };
+    let fill, stroke;
+    if (pn.kind === 'floorReveal' || pn.kind === 'floorUnlock') {
+      fill = canBuy ? `rgba(180, 130, 60, ${0.85 + pulse*0.1})` : 'rgba(120, 90, 60, 0.85)';
+      stroke = canBuy ? 'rgba(255, 220, 130, 0.95)' : 'rgba(180, 150, 100, 0.6)';
+    } else if (pn.kind === 'timeMachine') {
+      fill = `rgba(150, 80, 200, ${0.85 + pulse*0.15})`;
+      stroke = 'rgba(220, 170, 255, 0.95)';
+    } else {
+      fill = canBuy ? `rgba(50, 100, 160, ${0.85 + pulse*0.1})` : 'rgba(80, 80, 100, 0.85)';
+      stroke = canBuy ? 'rgba(170, 230, 255, 0.95)' : 'rgba(120, 130, 150, 0.6)';
+    }
+    pad(pn.x, pn.y, 110, 110, fill, stroke);
+    // Glow ring on floor
+    if (canBuy) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const g = w2s(pn.x, pn.y);
+      ctx.fillStyle = `rgba(120, 220, 255, ${0.18 * pulse})`;
+      ctx.beginPath(); ctx.ellipse(g.x, g.y, 80, 30, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    // Floating sign
+    const signZ = 70;
+    const sign = w2s(pn.x, pn.y, signZ);
+    const base = w2s(pn.x, pn.y, 0);
+    ctx.strokeStyle = 'rgba(30, 50, 80, 0.6)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(base.x, base.y);
+    ctx.lineTo(sign.x, sign.y + 22);
+    ctx.stroke();
+    // Card
+    const cardW = 140, cardH = 60;
+    const cgrd = ctx.createLinearGradient(0, sign.y - cardH, 0, sign.y);
+    cgrd.addColorStop(0, 'rgba(30, 50, 90, 0.96)');
+    cgrd.addColorStop(1, 'rgba(15, 30, 60, 0.96)');
+    ctx.fillStyle = cgrd;
+    roundRect(ctx, sign.x - cardW/2, sign.y - cardH, cardW, cardH, 9);
+    ctx.fill();
+    ctx.strokeStyle = canBuy ? '#aaf0ff' : '#888';
+    ctx.lineWidth = 1.6;
+    if (canBuy) { ctx.shadowColor = '#66e0ff'; ctx.shadowBlur = 10; }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // Title
+    ctx.fillStyle = canBuy ? '#aaf0ff' : '#bbb';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(pn.icon + ' ' + pn.label, sign.x, sign.y - cardH + 18);
+    // Cost
+    if (pn.cost > 0) {
+      ctx.fillStyle = canBuy ? '#ffd84a' : '#888';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.fillText('¥' + pn.cost, sign.x, sign.y - cardH + 42);
+    } else {
+      ctx.fillStyle = '#aaffaa';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.fillText('無料', sign.x, sign.y - cardH + 42);
+    }
+  }
+
+  // Sell building — small lab on the camp strip
+  function drawSellBuilding() {
+    const z = state.sellZone;
+    drawIsoShadow(z.x, z.y + 8, 110, 40, 0.35);
+    const cornerBL = w2s(z.x - 90, z.y + 30, 0);
+    const cornerBR = w2s(z.x + 90, z.y + 30, 0);
+    const cornerTR = w2s(z.x + 90, z.y - 30, 0);
+    const cornerTL = w2s(z.x - 90, z.y - 30, 0);
+    const H = 90;
+    const topBL = w2s(z.x - 90, z.y + 30, H);
+    const topBR = w2s(z.x + 90, z.y + 30, H);
+    const topTR = w2s(z.x + 90, z.y - 30, H);
+    const topTL = w2s(z.x - 90, z.y - 30, H);
+    // Right wall
+    ctx.fillStyle = '#2d4878';
+    ctx.beginPath();
+    ctx.moveTo(cornerBR.x, cornerBR.y); ctx.lineTo(cornerTR.x, cornerTR.y);
+    ctx.lineTo(topTR.x, topTR.y); ctx.lineTo(topBR.x, topBR.y);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+    // Front
+    ctx.fillStyle = '#3a5a90';
+    ctx.beginPath();
+    ctx.moveTo(cornerBL.x, cornerBL.y); ctx.lineTo(cornerBR.x, cornerBR.y);
+    ctx.lineTo(topBR.x, topBR.y); ctx.lineTo(topBL.x, topBL.y);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // Roof
+    ctx.fillStyle = '#4a7ab0';
+    ctx.beginPath();
+    ctx.moveTo(topTL.x, topTL.y); ctx.lineTo(topTR.x, topTR.y);
+    ctx.lineTo(topBR.x, topBR.y); ctx.lineTo(topBL.x, topBL.y);
+    ctx.closePath(); ctx.fill();
+    ctx.shadowColor = '#88e0ff'; ctx.shadowBlur = 12;
+    ctx.strokeStyle = 'rgba(170, 230, 255, 0.85)'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.shadowBlur = 0;
+    // Door label
+    const labelCenter = w2s(z.x, z.y + 30, H * 0.5);
+    ctx.fillStyle = 'rgba(10, 20, 40, 0.85)';
+    roundRect(ctx, labelCenter.x - 50, labelCenter.y - 15, 100, 30, 6);
+    ctx.fill();
+    ctx.fillStyle = '#aaf0ff';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = '#66e0ff'; ctx.shadowBlur = 8;
+    ctx.fillText('⏣ 売却所', labelCenter.x, labelCenter.y);
+    ctx.shadowBlur = 0;
+  }
+
+  // Mammoth
+  function drawMammoth(e) {
+    if (e.isBoss) {
+      drawBoss(e);
+      return;
+    }
+    const wob = Math.sin(e.bobPhase) * 2;
+    const walk = Math.sin(e.anim) * 3;
+    drawIsoShadow(e.x, e.y, 36, 13, 0.4);
+    const base = w2s(e.x, e.y, 0);
+    const cy = base.y - 28 + wob;
+    ctx.save();
+    if (e.hitFlash > 0) { ctx.shadowColor = '#88e0ff'; ctx.shadowBlur = 22; }
+    const bodyGrd = ctx.createRadialGradient(base.x - 8, cy - 12, 6, base.x, cy, 42);
+    bodyGrd.addColorStop(0, '#a4734a');
+    bodyGrd.addColorStop(0.6, '#7d4f2b');
+    bodyGrd.addColorStop(1, '#3d2817');
+    ctx.fillStyle = bodyGrd;
+    ctx.beginPath(); ctx.ellipse(base.x, cy, 36, 30, 0, 0, TAU); ctx.fill();
+    // Fringe
+    ctx.strokeStyle = '#3d2817'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * TAU;
+      const r1x = Math.cos(a) * 36, r1y = Math.sin(a) * 30;
+      const r2x = Math.cos(a) * (42 + Math.sin(i*1.4)*2);
+      const r2y = Math.sin(a) * (35 + Math.sin(i*1.4)*2);
+      ctx.moveTo(base.x + r1x, cy + r1y);
+      ctx.lineTo(base.x + r2x, cy + r2y);
+    }
+    ctx.stroke();
+    const fac = facingToDelta(e.facing);
+    const headSign = Math.sign(fac.sx) || 1;
+    const headOff = headSign * 22;
+    ctx.fillStyle = '#7d5232';
+    ctx.beginPath(); ctx.ellipse(base.x + headOff * 0.6, cy + 8, 16, 13, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#5a3a22'; ctx.lineWidth = 8; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(base.x + headOff * 0.5, cy + 14);
+    ctx.quadraticCurveTo(base.x + headOff * 0.6, cy + 28, base.x + headOff * 0.7 + Math.sin(e.anim)*3, cy + 36);
+    ctx.stroke();
+    // Tusks
+    ctx.fillStyle = '#f4ead0'; ctx.strokeStyle = '#a89770'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(base.x + headOff * 0.4, cy + 16);
+    ctx.quadraticCurveTo(base.x + headOff * 0.3, cy + 28, base.x + headOff * 0.5, cy + 34);
+    ctx.quadraticCurveTo(base.x + headOff * 0.55, cy + 26, base.x + headOff * 0.5, cy + 18);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(base.x + headOff * 0.85, cy + 16);
+    ctx.quadraticCurveTo(base.x + headOff * 0.95, cy + 28, base.x + headOff * 0.75, cy + 34);
+    ctx.quadraticCurveTo(base.x + headOff * 0.7, cy + 26, base.x + headOff * 0.75, cy + 18);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // Eyes
+    ctx.fillStyle = '#1a0f08';
+    ctx.beginPath();
+    ctx.arc(base.x + headOff * 0.5, cy + 4, 2.2, 0, TAU);
+    ctx.arc(base.x + headOff * 0.85, cy + 4, 2.2, 0, TAU);
+    ctx.fill();
+    // Feet
+    ctx.fillStyle = '#3d2817';
+    ctx.beginPath();
+    ctx.ellipse(base.x - 18, base.y - 6 + walk * 0.3, 6, 4, 0, 0, TAU);
+    ctx.ellipse(base.x + 18, base.y - 6 - walk * 0.3, 6, 4, 0, 0, TAU);
+    ctx.ellipse(base.x - 8, base.y - 2, 6, 4, 0, 0, TAU);
+    ctx.ellipse(base.x + 8, base.y - 2, 6, 4, 0, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+    // HP bar
+    if (e.hp < e.maxHp) {
+      const top = w2s(e.x, e.y, 76);
+      const w = 50, h = 5;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(top.x - w/2, top.y, w, h);
+      const pct = Math.max(0, e.hp / e.maxHp);
+      ctx.fillStyle = pct > 0.5 ? '#88e0ff' : (pct > 0.25 ? '#ffaa55' : '#ff5454');
+      ctx.fillRect(top.x - w/2, top.y, w * pct, h);
+    }
+  }
+
+  // Boss draw — bigger, glowing, with crown for final boss
+  function drawBoss(e) {
+    const isFinal = e.bossType === 'final';
+    const tint = isFinal ? '#c878ff' : '#ff8a40';
+    const glowColor = isFinal ? '#e8a0ff' : '#ffb060';
+    const wob = Math.sin(e.bobPhase) * 3;
+    const walk = Math.sin(e.anim) * 4;
+    const sz = e.r;
+    drawIsoShadow(e.x, e.y, sz * 1.05, sz * 0.4, 0.5);
+    const base = w2s(e.x, e.y, 0);
+    const cy = base.y - sz * 0.85 + wob;
+    ctx.save();
+
+    // Aura — pulsing glow around the boss
+    ctx.globalCompositeOperation = 'lighter';
+    const auraR = sz * 1.6 + Math.sin(e.bobPhase * 2) * 6;
+    const aura = ctx.createRadialGradient(base.x, cy, 4, base.x, cy, auraR);
+    aura.addColorStop(0, isFinal ? 'rgba(200, 120, 255, 0.40)' : 'rgba(255, 138, 64, 0.40)');
+    aura.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = aura;
+    ctx.beginPath(); ctx.arc(base.x, cy, auraR, 0, TAU); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+
+    if (e.hitFlash > 0) { ctx.shadowColor = glowColor; ctx.shadowBlur = 26; }
+
+    // Body
+    const bodyGrd = ctx.createRadialGradient(base.x - sz*0.25, cy - sz*0.4, 8, base.x, cy, sz * 1.3);
+    if (isFinal) {
+      bodyGrd.addColorStop(0, '#a4647a');
+      bodyGrd.addColorStop(0.55, '#683048');
+      bodyGrd.addColorStop(1, '#28102a');
+    } else {
+      bodyGrd.addColorStop(0, '#d4a060');
+      bodyGrd.addColorStop(0.55, '#a06030');
+      bodyGrd.addColorStop(1, '#502810');
+    }
+    ctx.fillStyle = bodyGrd;
+    ctx.beginPath(); ctx.ellipse(base.x, cy, sz, sz * 0.85, 0, 0, TAU); ctx.fill();
+
+    // Fringe (more strands than regular mammoth)
+    ctx.strokeStyle = isFinal ? '#1a0820' : '#3d2817';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * TAU;
+      const r1x = Math.cos(a) * sz, r1y = Math.sin(a) * sz * 0.85;
+      const r2x = Math.cos(a) * (sz * 1.18 + Math.sin(i*1.4)*3);
+      const r2y = Math.sin(a) * (sz * 1.0 + Math.sin(i*1.4)*3);
+      ctx.moveTo(base.x + r1x, cy + r1y);
+      ctx.lineTo(base.x + r2x, cy + r2y);
+    }
+    ctx.stroke();
+
+    const fac = facingToDelta(e.facing);
+    const headSign = Math.sign(fac.sx) || 1;
+    const headOff = headSign * sz * 0.7;
+
+    // Head
+    ctx.fillStyle = isFinal ? '#5a2840' : '#7d5232';
+    ctx.beginPath();
+    ctx.ellipse(base.x + headOff * 0.6, cy + sz * 0.3, sz * 0.45, sz * 0.4, 0, 0, TAU);
+    ctx.fill();
+
+    // Trunk (longer)
+    ctx.strokeStyle = isFinal ? '#3a1830' : '#5a3a22';
+    ctx.lineWidth = sz * 0.28;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(base.x + headOff * 0.5, cy + sz * 0.45);
+    ctx.quadraticCurveTo(
+      base.x + headOff * 0.65, cy + sz * 0.85,
+      base.x + headOff * 0.75 + Math.sin(e.anim)*4, cy + sz * 1.1
+    );
+    ctx.stroke();
+
+    // Tusks (much bigger, glowing on final)
+    if (isFinal) { ctx.shadowColor = glowColor; ctx.shadowBlur = 12; }
+    ctx.fillStyle = '#f4ead0'; ctx.strokeStyle = '#a89770'; ctx.lineWidth = 1.5;
+    const tuskLen = sz * 0.75;
+    const tuskBase1X = base.x + headOff * 0.4;
+    const tuskBase2X = base.x + headOff * 0.85;
+    ctx.beginPath();
+    ctx.moveTo(tuskBase1X, cy + sz * 0.5);
+    ctx.quadraticCurveTo(tuskBase1X - headSign * 6, cy + sz * 0.85, tuskBase1X, cy + sz * 0.5 + tuskLen);
+    ctx.quadraticCurveTo(tuskBase1X + headSign * 4, cy + sz * 0.85, tuskBase1X, cy + sz * 0.5);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(tuskBase2X, cy + sz * 0.5);
+    ctx.quadraticCurveTo(tuskBase2X + headSign * 6, cy + sz * 0.85, tuskBase2X, cy + sz * 0.5 + tuskLen);
+    ctx.quadraticCurveTo(tuskBase2X - headSign * 4, cy + sz * 0.85, tuskBase2X, cy + sz * 0.5);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Crown for final boss
+    if (isFinal) {
+      const crownY = cy - sz * 0.05;
+      ctx.fillStyle = '#ffd84a';
+      ctx.strokeStyle = '#a07020';
+      ctx.lineWidth = 1.5;
+      ctx.shadowColor = '#ffe6a0'; ctx.shadowBlur = 14;
+      ctx.beginPath();
+      ctx.moveTo(base.x - sz * 0.5, crownY + 6);
+      ctx.lineTo(base.x - sz * 0.5, crownY - 6);
+      ctx.lineTo(base.x - sz * 0.25, crownY + 4);
+      ctx.lineTo(base.x, crownY - 12);
+      ctx.lineTo(base.x + sz * 0.25, crownY + 4);
+      ctx.lineTo(base.x + sz * 0.5, crownY - 6);
+      ctx.lineTo(base.x + sz * 0.5, crownY + 6);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.shadowBlur = 0;
+      // Gemstones
+      ctx.fillStyle = '#ff80c0';
+      ctx.beginPath(); ctx.arc(base.x - sz * 0.25, crownY, 2.5, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(base.x + sz * 0.25, crownY, 2.5, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#80ffe0';
+      ctx.beginPath(); ctx.arc(base.x, crownY - 6, 2.5, 0, TAU); ctx.fill();
+    }
+
+    // Eyes — glowing
+    ctx.fillStyle = isFinal ? '#ff80c0' : '#ffaa20';
+    ctx.shadowColor = isFinal ? '#ff80c0' : '#ffaa20';
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.arc(base.x + headOff * 0.5, cy + sz * 0.2, 3, 0, TAU);
+    ctx.arc(base.x + headOff * 0.85, cy + sz * 0.2, 3, 0, TAU);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Feet
+    ctx.fillStyle = isFinal ? '#1a0820' : '#3d2817';
+    ctx.beginPath();
+    ctx.ellipse(base.x - sz*0.5, base.y - 6 + walk * 0.3, sz*0.18, sz*0.1, 0, 0, TAU);
+    ctx.ellipse(base.x + sz*0.5, base.y - 6 - walk * 0.3, sz*0.18, sz*0.1, 0, 0, TAU);
+    ctx.ellipse(base.x - sz*0.22, base.y - 2, sz*0.18, sz*0.1, 0, 0, TAU);
+    ctx.ellipse(base.x + sz*0.22, base.y - 2, sz*0.18, sz*0.1, 0, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+
+    // Boss HP bar — bigger, with name label
+    const top = w2s(e.x, e.y, sz * 2.4);
+    const w = sz * 2.6, h = 9;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    roundRect(ctx, top.x - w/2 - 2, top.y - 2, w + 4, h + 4, 5); ctx.fill();
+    const pct = Math.max(0, e.hp / e.maxHp);
+    const grd = ctx.createLinearGradient(top.x - w/2, top.y, top.x + w/2, top.y);
+    if (isFinal) { grd.addColorStop(0, '#c878ff'); grd.addColorStop(1, '#ff80c0'); }
+    else         { grd.addColorStop(0, '#ff8a40'); grd.addColorStop(1, '#ffd084'); }
+    ctx.fillStyle = grd;
+    roundRect(ctx, top.x - w/2, top.y, w * pct, h, 4); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.shadowColor = tint; ctx.shadowBlur = 8;
+    ctx.fillText(isFinal ? '👑 マンモスキング' : '⚔ サーベルマンモス', top.x, top.y - 4);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+
+  // Player — with bike alternative
+  function drawPlayer() {
+    const p = state.player;
+    drawIsoShadow(p.x, p.y, p.hasBike ? 36 : 28, p.hasBike ? 14 : 12, 0.4);
+    const base = w2s(p.x, p.y, 0);
+    const facing = facingToDelta(p.facing);
+    const moving = input.active && Math.hypot(input.cx - input.sx, input.cy - input.sy) > 8;
+    const bob = moving ? Math.sin(p.walkPhase) * 2 : 0;
+    ctx.save();
+    // Aura
+    ctx.globalCompositeOperation = 'lighter';
+    const aurR = 28 + Math.sin(p.glowPhase) * 3;
+    const aura = ctx.createRadialGradient(base.x, base.y - 25, 4, base.x, base.y - 25, aurR + 14);
+    aura.addColorStop(0, 'rgba(120, 220, 255, 0.35)');
+    aura.addColorStop(1, 'rgba(120, 220, 255, 0)');
+    ctx.fillStyle = aura;
+    ctx.beginPath(); ctx.arc(base.x, base.y - 25, aurR + 14, 0, TAU); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+
+    if (p.hasBike) {
+      // Bike body — sci-fi hover bike
+      // Lower wheels (or hover thrusters)
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath();
+      ctx.ellipse(base.x - 14, base.y - 4, 8, 5, 0, 0, TAU);
+      ctx.ellipse(base.x + 14, base.y - 4, 8, 5, 0, 0, TAU);
+      ctx.fill();
+      // Wheel cores (glowing)
+      ctx.fillStyle = '#88e0ff';
+      ctx.shadowColor = '#66e0ff'; ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.arc(base.x - 14, base.y - 4, 3.5, 0, TAU);
+      ctx.arc(base.x + 14, base.y - 4, 3.5, 0, TAU);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      // Bike chassis
+      const bikeGrd = ctx.createLinearGradient(base.x - 18, base.y - 18, base.x + 18, base.y - 6);
+      bikeGrd.addColorStop(0, '#dfeaf3');
+      bikeGrd.addColorStop(0.5, '#7c8ca0');
+      bikeGrd.addColorStop(1, '#3a4658');
+      ctx.fillStyle = bikeGrd;
+      roundRect(ctx, base.x - 18, base.y - 16, 36, 12, 5);
+      ctx.fill();
+      ctx.strokeStyle = '#1a2030'; ctx.lineWidth = 1; ctx.stroke();
+      // Trail thrust at back
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = `rgba(120, 220, 255, ${moving ? 0.6 : 0.25})`;
+      const tailX = base.x + (facing.sx < 0 ? 22 : -22);
+      ctx.beginPath();
+      ctx.ellipse(tailX, base.y - 8, 6, 3, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+
+      // Rider torso (sitting position)
+      const torsoY = base.y - 26;
+      const tgrd = ctx.createLinearGradient(base.x - 12, torsoY - 8, base.x + 12, torsoY + 8);
+      tgrd.addColorStop(0, '#dde6f0');
+      tgrd.addColorStop(0.5, '#7c8ca0');
+      tgrd.addColorStop(1, '#3a4658');
+      ctx.fillStyle = tgrd;
+      roundRect(ctx, base.x - 10, torsoY - 7, 20, 16, 5);
+      ctx.fill();
+      ctx.strokeStyle = '#1a2030'; ctx.lineWidth = 1; ctx.stroke();
+      // Reactor
+      ctx.fillStyle = `rgba(120, 220, 255, ${0.7 + Math.sin(p.glowPhase * 2) * 0.3})`;
+      ctx.shadowColor = '#66e0ff'; ctx.shadowBlur = 12;
+      ctx.beginPath(); ctx.arc(base.x, torsoY, 4, 0, TAU); ctx.fill();
+      ctx.shadowBlur = 0;
+      // Helmet
+      const headY = torsoY - 16;
+      const helm = ctx.createRadialGradient(base.x - 4, headY - 4, 2, base.x, headY, 12);
+      helm.addColorStop(0, '#dfeaf3'); helm.addColorStop(0.5, '#8fa0b8'); helm.addColorStop(1, '#3a4658');
+      ctx.fillStyle = helm;
+      ctx.beginPath(); ctx.arc(base.x, headY, 11, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#1a2030'; ctx.lineWidth = 1; ctx.stroke();
+      // Visor
+      ctx.fillStyle = '#0a1428';
+      const vox = facing.sx * 4, voy = facing.sy * 2;
+      roundRect(ctx, base.x - 8 + vox, headY - 2 + voy, 16, 4, 2); ctx.fill();
+      const scanGrd = ctx.createLinearGradient(base.x - 8, headY, base.x + 8, headY);
+      scanGrd.addColorStop(0, 'rgba(120, 220, 255, 0)');
+      scanGrd.addColorStop(0.5, 'rgba(170, 240, 255, 0.95)');
+      scanGrd.addColorStop(1, 'rgba(120, 220, 255, 0)');
+      ctx.fillStyle = scanGrd;
+      roundRect(ctx, base.x - 8 + vox, headY - 0.5 + voy, 16, 1.6, 1); ctx.fill();
+    } else {
+      // On foot — same as before but condensed
+      // Legs
+      ctx.fillStyle = '#3a4658';
+      ctx.beginPath();
+      ctx.ellipse(base.x - 6, base.y - 4 + bob * 0.2, 5, 7, 0, 0, TAU);
+      ctx.ellipse(base.x + 6, base.y - 4 - bob * 0.2, 5, 7, 0, 0, TAU);
+      ctx.fill();
+      // Torso
+      const torsoY = base.y - 24 + bob * 0.4;
+      const grd = ctx.createLinearGradient(base.x - 14, torsoY - 14, base.x + 14, torsoY + 14);
+      grd.addColorStop(0, '#dde6f0');
+      grd.addColorStop(0.5, '#7c8ca0');
+      grd.addColorStop(1, '#3a4658');
+      ctx.fillStyle = grd;
+      roundRect(ctx, base.x - 13, torsoY - 12, 26, 24, 7);
+      ctx.fill();
+      ctx.strokeStyle = '#1a2030'; ctx.lineWidth = 1; ctx.stroke();
+      // Reactor
+      ctx.fillStyle = `rgba(120, 220, 255, ${0.7 + Math.sin(p.glowPhase * 2) * 0.3})`;
+      ctx.shadowColor = '#66e0ff'; ctx.shadowBlur = 14;
+      ctx.beginPath(); ctx.arc(base.x, torsoY - 2, 5, 0, TAU); ctx.fill();
+      ctx.shadowBlur = 0;
+      // Helmet
+      const headY = torsoY - 22;
+      const helm = ctx.createRadialGradient(base.x - 4, headY - 4, 2, base.x, headY, 14);
+      helm.addColorStop(0, '#dfeaf3'); helm.addColorStop(0.5, '#8fa0b8'); helm.addColorStop(1, '#3a4658');
+      ctx.fillStyle = helm;
+      ctx.beginPath(); ctx.arc(base.x, headY, 12, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#1a2030'; ctx.lineWidth = 1; ctx.stroke();
+      ctx.fillStyle = '#0a1428';
+      const vox = facing.sx * 5, voy = facing.sy * 3;
+      roundRect(ctx, base.x - 9 + vox, headY - 2 + voy, 18, 5, 2); ctx.fill();
+      const scanGrd = ctx.createLinearGradient(base.x - 9, headY, base.x + 9, headY);
+      scanGrd.addColorStop(0, 'rgba(120, 220, 255, 0)');
+      scanGrd.addColorStop(0.5, 'rgba(170, 240, 255, 0.95)');
+      scanGrd.addColorStop(1, 'rgba(120, 220, 255, 0)');
+      ctx.fillStyle = scanGrd;
+      roundRect(ctx, base.x - 9 + vox, headY - 0.5 + voy, 18, 2, 1); ctx.fill();
+    }
+    ctx.restore();
+
+    // Stack of meats above the player
+    drawPlayerMeatStack(base);
+  }
+
+  function drawPlayerMeatStack(base) {
+    if (state.stack.length === 0) return;
+    const stackBase = base.y - (state.player.hasBike ? 38 : 50);
+    const colTop = stackBase - state.stack.length * 8;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const beamGrd = ctx.createLinearGradient(base.x, stackBase + 18, base.x, colTop - 6);
+    beamGrd.addColorStop(0, 'rgba(120, 220, 255, 0.0)');
+    beamGrd.addColorStop(0.3, 'rgba(120, 220, 255, 0.25)');
+    beamGrd.addColorStop(1, 'rgba(170, 240, 255, 0.05)');
+    ctx.fillStyle = beamGrd;
+    const beamW = 24 + Math.sin(state.time * 0.2) * 2;
+    ctx.beginPath();
+    ctx.moveTo(base.x - beamW/2, stackBase + 18);
+    ctx.lineTo(base.x + beamW/2, stackBase + 18);
+    ctx.lineTo(base.x + beamW/2 - 4, colTop - 6);
+    ctx.lineTo(base.x - beamW/2 + 4, colTop - 6);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    const dxIn = input.active ? (input.cx - input.sx) : 0;
+    const lean = Math.max(-0.3, Math.min(0.3, dxIn * 0.003));
+    for (let i = 0; i < state.stack.length; i++) {
+      const s = state.stack[i];
+      const yOff = -i * 8;
+      const float = Math.sin(state.time * 0.15 + i * 0.5) * 1.5;
+      const wob = Math.sin(state.time * 0.12 + i * 0.7) * (0.5 + i * 0.18);
+      const xOff = wob - lean * (i * 4);
+      const rot = wob * 0.04 + s.jiggle * Math.sin(s.jp) * 0.4;
+      const sc = 1 + s.jiggle * 0.15;
+      ctx.save();
+      ctx.fillStyle = 'rgba(120, 220, 255, 0.25)';
+      ctx.beginPath();
+      ctx.ellipse(base.x + xOff, stackBase + yOff + float + 5, 13, 3, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+      drawMeat(base.x + xOff, stackBase + yOff + float, sc, rot, 0.5);
+    }
+  }
+
+  function drawMeat(x, y, scale, rot, glow) {
+    scale = scale || 1; rot = rot || 0; glow = glow || 0;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.scale(scale, scale);
+    if (glow > 0) { ctx.shadowColor = '#66c8ff'; ctx.shadowBlur = 12 * glow; }
+    ctx.fillStyle = '#a83228';
+    ctx.beginPath(); ctx.ellipse(0, 0, 13, 9, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#d44c3c';
+    ctx.beginPath(); ctx.ellipse(-1, -1, 9, 6, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#ff8b76';
+    ctx.beginPath(); ctx.ellipse(-3, -3, 4, 2, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#f5e9c8';
+    ctx.fillRect(-15, -2.5, 7, 5);
+    ctx.beginPath();
+    ctx.arc(-15, -2.5, 3, 0, TAU);
+    ctx.arc(-15, 2.5, 3, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.ellipse(0, 0, 13, 9, 0, 0, TAU); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawGroundMeat(m) {
+    const s = w2s(m.x, m.y);
+    const fadeStart = 1300;
+    const alpha = m.life > fadeStart ? Math.max(0, 1 - (m.life - fadeStart) / 200) : 1;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    drawIsoShadow(m.x, m.y, 11, 4, 0.3 * alpha);
+    drawMeat(s.x, s.y - m.gz, 1, Math.sin(m.life * 0.05) * 0.3);
+    ctx.restore();
+  }
+
+  // NPC Hunter (caveman with spear)
+  function drawHunterNPC(h) {
+    drawIsoShadow(h.x, h.y, 14, 5, 0.35);
+    const base = w2s(h.x, h.y, 0);
+    const torsoY = base.y - 22;
+    const facing = facingToDelta(h.facing);
+    const tints = [
+      ['#ffb84a', '#c87a20', '#5a3608'],
+      ['#a4d44a', '#6e8a20', '#2e3a08'],
+      ['#d44a8a', '#8a2058', '#3a0828'],
+      ['#4ad4d4', '#208a8a', '#082e3a'],
+    ];
+    const tint = tints[h.tint || 0];
+    const bob = h.target ? Math.sin(h.walkPhase) * 1.5 : Math.sin(h.bob) * 1;
+    ctx.save();
+    // Legs
+    ctx.fillStyle = '#3a2a1a';
+    ctx.beginPath();
+    ctx.ellipse(base.x - 4, base.y - 4, 4, 6, 0, 0, TAU);
+    ctx.ellipse(base.x + 4, base.y - 4 + bob * 0.5, 4, 6, 0, 0, TAU);
+    ctx.fill();
+    // Torso
+    const grd = ctx.createLinearGradient(base.x - 12, torsoY - 10, base.x + 12, torsoY + 10);
+    grd.addColorStop(0, tint[0]); grd.addColorStop(0.5, tint[1]); grd.addColorStop(1, tint[2]);
+    ctx.fillStyle = grd;
+    roundRect(ctx, base.x - 11, torsoY - 8, 22, 18, 5);
+    ctx.fill();
+    ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 1; ctx.stroke();
+    // Head
+    const headY = torsoY - 18;
+    ctx.fillStyle = '#e8c896';
+    ctx.beginPath(); ctx.arc(base.x, headY, 9, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 0.8; ctx.stroke();
+    ctx.fillStyle = tint[2];
+    ctx.beginPath(); ctx.arc(base.x, headY - 4, 7, Math.PI, TAU); ctx.fill();
+    ctx.fillStyle = '#1a1208';
+    const vo = facing.sx * 2;
+    ctx.beginPath();
+    ctx.arc(base.x - 2.5 + vo, headY - 1, 1.3, 0, TAU);
+    ctx.arc(base.x + 2.5 + vo, headY - 1, 1.3, 0, TAU);
+    ctx.fill();
+    // Spear
+    ctx.strokeStyle = '#6a4628'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+    const spearScreen = (h.target ? facing.sx : 1) > 0 ? 1 : -1;
+    ctx.beginPath();
+    ctx.moveTo(base.x + spearScreen * 8, torsoY + 2);
+    ctx.lineTo(base.x + spearScreen * 18, torsoY - 8);
+    ctx.stroke();
+    ctx.fillStyle = '#cccccc';
+    ctx.beginPath();
+    ctx.arc(base.x + spearScreen * 18, torsoY - 8, 2, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  // NPC Collector (caveman with basket)
+  function drawCollectorNPC(c) {
+    drawIsoShadow(c.x, c.y, 14, 5, 0.35);
+    const base = w2s(c.x, c.y, 0);
+    const torsoY = base.y - 22;
+    const facing = facingToDelta(c.facing);
+    const tints = [
+      ['#7af0d4', '#208a78', '#082e26'],
+      ['#a8e8ff', '#4470a0', '#103048'],
+      ['#ffd4a0', '#a07840', '#3a2810'],
+      ['#d8b8ff', '#7858a0', '#281840'],
+    ];
+    const tint = tints[c.tint || 0];
+    const bob = c.mode !== 'idle' ? Math.sin(c.walkPhase) * 1.5 : Math.sin(c.bob) * 1;
+    ctx.save();
+    // Legs
+    ctx.fillStyle = '#3a2a1a';
+    ctx.beginPath();
+    ctx.ellipse(base.x - 4, base.y - 4, 4, 6, 0, 0, TAU);
+    ctx.ellipse(base.x + 4, base.y - 4 + bob * 0.5, 4, 6, 0, 0, TAU);
+    ctx.fill();
+    // Torso
+    const grd = ctx.createLinearGradient(base.x - 12, torsoY - 10, base.x + 12, torsoY + 10);
+    grd.addColorStop(0, tint[0]); grd.addColorStop(0.5, tint[1]); grd.addColorStop(1, tint[2]);
+    ctx.fillStyle = grd;
+    roundRect(ctx, base.x - 11, torsoY - 8, 22, 18, 5);
+    ctx.fill();
+    ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 1; ctx.stroke();
+    // Head
+    const headY = torsoY - 18;
+    ctx.fillStyle = '#e8c896';
+    ctx.beginPath(); ctx.arc(base.x, headY, 9, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 0.8; ctx.stroke();
+    ctx.fillStyle = tint[2];
+    ctx.beginPath(); ctx.arc(base.x, headY - 4, 7, Math.PI, TAU); ctx.fill();
+    ctx.fillStyle = '#1a1208';
+    const vo = facing.sx * 2;
+    ctx.beginPath();
+    ctx.arc(base.x - 2.5 + vo, headY - 1, 1.3, 0, TAU);
+    ctx.arc(base.x + 2.5 + vo, headY - 1, 1.3, 0, TAU);
+    ctx.fill();
+    // Basket on the back (when carrying meat, draw a piece on top)
+    ctx.fillStyle = '#7a5a30';
+    roundRect(ctx, base.x - 9, torsoY - 14, 18, 8, 3);
+    ctx.fill();
+    ctx.strokeStyle = '#3a2a18'; ctx.lineWidth = 1; ctx.stroke();
+    if (c.hold) {
+      drawMeat(base.x, torsoY - 16, 0.7, 0, 0.4);
+    }
+    ctx.restore();
+  }
+
+  function drawDrone(d) {
+    drawIsoShadow(d.x, d.y, 14, 5, 0.3);
+    const c = w2s(d.x, d.y, d.z);
+    ctx.save();
+    const bodyGrd = ctx.createRadialGradient(c.x - 3, c.y - 3, 2, c.x, c.y, 12);
+    bodyGrd.addColorStop(0, '#dde6f0');
+    bodyGrd.addColorStop(0.6, '#7c8ca0');
+    bodyGrd.addColorStop(1, '#3a4658');
+    ctx.fillStyle = bodyGrd;
+    ctx.beginPath(); ctx.ellipse(c.x, c.y, 10, 8, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#1a2030'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = `rgba(120, 220, 255, ${0.7 + Math.sin(d.bob * 2) * 0.3})`;
+    ctx.shadowColor = '#66e0ff'; ctx.shadowBlur = 8;
+    ctx.beginPath(); ctx.arc(c.x, c.y - 1, 2.5, 0, TAU); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(180, 220, 255, 0.5)';
+    ctx.lineWidth = 1.5;
+    const rotorAng = d.bob * 6;
+    for (let k = 0; k < 4; k++) {
+      const ra = rotorAng + k * Math.PI / 2;
+      ctx.beginPath();
+      ctx.moveTo(c.x + Math.cos(ra) * 3, c.y - 6);
+      ctx.lineTo(c.x + Math.cos(ra) * 11, c.y - 6 - Math.sin(ra) * 1);
+      ctx.stroke();
+    }
+    if (d.hold) drawMeat(c.x, c.y + 12, 0.85, 0, 0.6);
+    ctx.restore();
+  }
+
+  function drawMoneyOrb(mo) {
+    drawIsoShadow(mo.x, mo.y, 12, 4, 0.3);
+    const s = w2s(mo.x, mo.y, mo.z + Math.sin(mo.bob) * 1);
+    // Stack of bills depending on amount
+    const bills = Math.min(6, 1 + Math.floor(mo.amount / 8));
+    for (let i = 0; i < bills; i++) {
+      const top = w2s(mo.x, mo.y, mo.z + i * 4 + Math.sin(mo.bob) * 1);
+      ctx.fillStyle = i === bills - 1 ? '#7ad97a' : '#5cb85c';
+      roundRect(ctx, top.x - 12, top.y - 5, 24, 6, 1);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(20, 50, 20, 0.5)'; ctx.lineWidth = 0.5; ctx.stroke();
+      if (i === bills - 1) {
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 8px sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('$', top.x, top.y - 2);
+      }
+    }
+    // Sparkle
+    if (Math.random() < 0.06) {
+      const a = Math.random() * TAU, sp = rand(0.5, 1.5);
+      state.particles.push({
+        x: mo.x, y: mo.y, z: mo.z + 8,
+        vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, vz: rand(0, 1),
+        life: 18, max: 18, color: '#ffd84a', r: 1.5,
+      });
+    }
+  }
+
+  function drawBeams() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const b of state.beams) {
+      const a = b.life / b.max;
+      const pw = b.power || 1;
+      const widen = 1 + (pw - 1) * 0.2;
+      const s1 = w2s(b.sx, b.sy, b.sz || 30);
+      const s2 = w2s(b.ex, b.ey, b.ez || 30);
+      ctx.strokeStyle = `rgba(120, 220, 255, ${0.35 * a})`;
+      ctx.lineWidth = 10 * widen; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y); ctx.stroke();
+      ctx.strokeStyle = `rgba(170, 240, 255, ${0.7 * a})`;
+      ctx.lineWidth = 5 * widen;
+      ctx.beginPath(); ctx.moveTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y); ctx.stroke();
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.95 * a})`;
+      ctx.lineWidth = 2 * widen;
+      ctx.beginPath(); ctx.moveTo(s1.x, s1.y); ctx.lineTo(s2.x, s2.y); ctx.stroke();
+      ctx.fillStyle = `rgba(170, 240, 255, ${0.6 * a})`;
+      ctx.beginPath(); ctx.arc(s2.x, s2.y, 8 * a * widen, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawShockwaves() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const sw of state.shockwaves) {
+      const a = sw.life / sw.lifeMax;
+      const c = w2s(sw.x, sw.y, 0);
+      ctx.strokeStyle = `rgba(170, 240, 255, ${0.7 * a})`;
+      ctx.lineWidth = 4 * a + 1;
+      ctx.beginPath(); ctx.ellipse(c.x, c.y, sw.r, sw.r * 0.5, 0, 0, TAU); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (const pa of state.particles) {
+      const a = pa.life / pa.max;
+      const s = w2s(pa.x, pa.y, pa.z || 0);
+      ctx.fillStyle = pa.color;
+      ctx.globalAlpha = a;
+      ctx.beginPath(); ctx.arc(s.x, s.y, pa.r, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPops() {
+    for (const p of state.pops) {
+      const u = 1 - p.life / p.max;
+      const s = w2s(p.worldX, p.worldY, p.z || 60);
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, 1 - u * 0.9 + 0.1);
+      const size = p.size || 26;
+      ctx.font = `bold ${size}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = p.stroke || '#3a2a00';
+      ctx.fillStyle = p.color || '#ffd84a';
+      if (p.glow) { ctx.shadowColor = p.color || '#aaf0ff'; ctx.shadowBlur = 14; }
+      ctx.strokeText(p.txt, s.x, s.y);
+      ctx.fillText(p.txt, s.x, s.y);
+      ctx.restore();
+    }
+  }
+
+  function drawFlying(f) {
+    const u = Math.min(1, f.t / f.dur);
+    if (f.kind === 'pickup') {
+      const p = state.player;
+      const tx = p.x, ty = p.y;
+      const tz = (p.hasBike ? 38 : 50) + state.stack.length * 8;
+      const x = lerp(f.sx, tx, u), y = lerp(f.sy, ty, u);
+      const z = lerp(f.sz || 0, tz, u) + Math.sin(u * Math.PI) * 80;
+      const s = w2s(x, y, z);
+      drawMeat(s.x, s.y, 1 + Math.sin(u * Math.PI) * 0.4, u * Math.PI * 1.2, 0.8);
+    } else {
+      const x = lerp(f.sx, f.tx, u), y = lerp(f.sy, f.ty, u);
+      const z = lerp(f.sz || 0, 50, u) + Math.sin(u * Math.PI) * 80;
+      const s = w2s(x, y, z);
+      drawMeat(s.x, s.y, 1, u * Math.PI * 2);
+    }
+  }
+
+  function drawJoystick() {
+    if (!input.active) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(170, 240, 255, 0.12)';
+    ctx.strokeStyle = 'rgba(170, 240, 255, 0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(input.sx, input.sy, 50, 0, TAU); ctx.fill(); ctx.stroke();
+    const dx = input.cx - input.sx, dy = input.cy - input.sy;
+    const d = Math.hypot(dx, dy);
+    const max = 50;
+    const f = d > max ? max / d : 1;
+    ctx.fillStyle = 'rgba(170, 240, 255, 0.55)';
+    ctx.shadowColor = '#88e0ff'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(input.sx + dx * f, input.sy + dy * f, 22, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  // ===========================================================
+  // RENDER
+  // ===========================================================
+  function render() {
+    ctx.clearRect(0, 0, CV_W, CV_H);
+    let shakeX = 0, shakeY = 0;
+    if (state.shake > 0) {
+      shakeX = (Math.random() - 0.5) * state.shake * 2;
+      shakeY = (Math.random() - 0.5) * state.shake * 2;
+    }
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+
+    // Floors back-to-front
+    const sortedFloors = Object.values(state.floors).slice().sort((a, b) => depth(a.cx, a.cy) - depth(b.cx, b.cy));
+    for (const f of sortedFloors) drawFloor(f);
+
+    // Ground-level overlays: panels
+    for (const pn of state.panels) drawPanel(pn);
+    drawShockwaves();
+
+    // Sortable entities
+    const drawables = [];
+    drawables.push({ d: depth(state.sellZone.x, state.sellZone.y), draw: drawSellBuilding });
+    for (const m of allMeats()) drawables.push({ d: depth(m.x, m.y), draw: () => drawGroundMeat(m) });
+    for (const e of allEnemies()) drawables.push({ d: depth(e.x, e.y), draw: () => drawMammoth(e) });
+    for (const h of state.hunters) drawables.push({ d: depth(h.x, h.y), draw: () => drawHunterNPC(h) });
+    for (const c of state.collectors) drawables.push({ d: depth(c.x, c.y), draw: () => drawCollectorNPC(c) });
+    for (const mo of state.moneyOrbs) drawables.push({ d: depth(mo.x, mo.y) - 1, draw: () => drawMoneyOrb(mo) });
+    for (const d of state.drones) drawables.push({ d: depth(d.x, d.y) + 5, draw: () => drawDrone(d) });
+    drawables.push({ d: depth(state.player.x, state.player.y), draw: drawPlayer });
+    drawables.sort((a, b) => a.d - b.d);
+    for (const d of drawables) d.draw();
+
+    drawBeams();
+    for (const f of state.flying) drawFlying(f);
+    drawParticles();
+    drawPops();
+    drawJoystick();
+
+    ctx.restore();
+    if (state.hitFlash > 0) {
+      ctx.fillStyle = `rgba(170, 240, 255, ${state.hitFlash * 0.3})`;
+      ctx.fillRect(0, 0, CV_W, CV_H);
+    }
+  }
+
+  // ===========================================================
+  // MAIN LOOP
+  // ===========================================================
+  let last = performance.now();
+  function tick(now) {
+    const raw = (now - last) / (1000 / 60);
+    const dt = Math.min(3, raw);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(tick);
+  }
+  // Seed enemies on origin floor
+  for (let i = 0; i < 4; i++) spawnEnemy(state.floors.origin);
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
